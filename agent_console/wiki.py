@@ -4,6 +4,7 @@ import contextvars
 import functools
 import fcntl
 import json
+import logging
 import os
 import hashlib
 import math
@@ -23,6 +24,8 @@ import safe_io
 
 from . import evidence_usage, qmd_search, shared_memory, storage
 from . import wiki_contract, wiki_index, wiki_ontology, wiki_usage_store
+
+logger = logging.getLogger(__name__)
 
 _USAGE_BATCH_CTX: contextvars.ContextVar[dict[str, dict[str, Any]] | None] = contextvars.ContextVar(
     "_USAGE_BATCH_CTX", default=None,
