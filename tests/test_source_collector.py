@@ -482,6 +482,60 @@ def test_fetch_polymarket_events_normalizes_gamma_markets(monkeypatch):
     assert event["classification"]["topic"] == "Fed"
     assert event["wiki_eligible"] is True
     assert event["raw_payload"]["event_id"] == "100"
+    assert "markets" not in event["raw_payload"]["event"]
+    assert event["raw_payload"]["event"]["slug"] == "fed-decision-september"
+    assert event["raw_payload"]["market_count"] == 1
+
+
+def test_polymarket_omits_nested_sibling_markets_from_raw_payload_event(monkeypatch):
+    sibling_markets = [
+        {
+            "id": str(200 + i),
+            "slug": f"fed-outcome-{i}",
+            "question": f"Will the Fed cut rates by {i} bps?",
+            "outcomes": '["Yes","No"]',
+            "outcomePrices": '["0.50","0.50"]',
+            "volume": "500000",
+            "liquidity": "10000",
+            "openInterest": "20000",
+            "endDate": "2026-09-16T00:00:00Z",
+            "active": True,
+            "closed": False,
+            "description": "x" * 2000,
+        }
+        for i in range(25)
+    ]
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "id": "100",
+                    "slug": "fed-decision-multi",
+                    "title": "Fed Decision Multi-Market",
+                    "active": True,
+                    "closed": False,
+                    "tags": [{"label": "Fed"}],
+                    "markets": sibling_markets,
+                }
+            ]
+
+    monkeypatch.setattr(sc.requests, "get", lambda *a, **k: FakeResponse())
+    events = sc.fetch_polymarket_events(limit=25, min_volume=1000, keywords=["Fed"])
+    assert len(events) == 25
+    for ev in events:
+        rp = ev["raw_payload"]
+        assert rp["event_id"] == "100"
+        assert rp["market_count"] == 25
+        assert "markets" not in rp["event"]
+        assert rp["market"]["id"] == rp["market_id"]
+        # Each serialized record must stay bounded (~3-5 KB), not O(N^2) ~55 KB+.
+        assert len(json.dumps(ev, ensure_ascii=False)) < 10_000
 
 
 def test_polymarket_451_is_recorded_as_region_blocked_not_stale(monkeypatch, tmp_path):

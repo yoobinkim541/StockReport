@@ -1747,6 +1747,9 @@ def fetch_polymarket_events(limit: int | None = None, *, min_volume: float | Non
         event_slug = str(event.get("slug") or event.get("ticker") or event.get("id") or "").strip()
         event_url = f"https://polymarket.com/event/{event_slug}" if event_slug else "https://polymarket.com"
         markets = event.get("markets") if isinstance(event.get("markets"), list) else [event]
+        # 부모 event 의 전체 markets 배열을 하위 마켓마다 중복 저장하면 다중 마켓 이벤트에서
+        # O(N^2) 페이로드 폭증(일 ~650MB)이 발생하므로, 이벤트 메타데이터만 보존하고 개별 market 을 첨부한다.
+        event_meta = {k: v for k, v in event.items() if k != "markets"}
         for market in markets:
             if market.get("closed") is True or market.get("active") is False:
                 continue
@@ -1804,8 +1807,9 @@ def fetch_polymarket_events(limit: int | None = None, *, min_volume: float | Non
                 "raw_payload": {
                     "event_id": str(event.get("id") or ""),
                     "market_id": market_id,
-                    "event": event,
-                    "market": market,
+                    "market_count": len(markets),
+                    "event": event_meta,
+                    "market": event_meta if market is event else market,
                 },
             })
     if events:

@@ -167,5 +167,5 @@ PATH=/home/ubuntu/.hermes/node/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/b
 */30 * * * * cd /home/ubuntu/projects/stock-report && uv run python tests/bot_healthcheck.py >> /tmp/bot_healthcheck.log 2>&1         # 매 30분
 
 # Scoped recommendation calibration diagnostics (immutable ledgers; no orders).
-# UTC 00:21/07:21 = KST 09:21/16:21. Refuse partial source snapshots above 128 MiB.
-21 0,7 * * 1-5 cd /home/ubuntu/projects/stock-report && flock -n /tmp/recommendation_calibration_refresh.lock uv run python crons/recommendation_calibration_refresh.py --max-bytes 134217728 >> /tmp/recommendation_calibration_refresh.log 2>&1
+# UTC 00:21/07:21 = KST 09:21/16:21. Bounded snapshot limits (512 MiB / 250k rows).
+21 0,7 * * 1-5 cd /home/ubuntu/projects/stock-report && flock -n /tmp/recommendation_calibration_refresh.lock uv run python crons/recommendation_calibration_refresh.py --max-bytes 536870912 --max-rows 250000 >> /tmp/recommendation_calibration_refresh.log 2>&1
