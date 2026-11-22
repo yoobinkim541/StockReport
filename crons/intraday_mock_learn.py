@@ -157,22 +157,33 @@ def gate_eval(rows: list[dict], market: str) -> dict:
     return out
 
 
-def _index_mdd(market: str, dates: list[str]) -> float:
-    """OOS 기간 벤치마크 일봉 MDD (동일 분수 단위). 실패 시 보수 0.10."""
+def _index_mdd(market: str, dates: list[str]) -> float | None:
+    """OOS 기간 벤치마크 일봉 MDD (동일 분수 단위). 실패 시 fail-closed None."""
     try:
+        import math
+        import pandas as pd
         import yfinance as yf
         from ml.adaptive import reward
-        ds = sorted(d for d in dates if d)
+        ds = sorted({str(d)[:10] for d in dates if d})
         if not ds:
-            return 0.10
-        data = yf.download(_BENCH[market], start=ds[0], end=None, progress=False)
-        closes = [float(x) for x in data["Close"].dropna().values]
+            return None
+        # yfinance end 는 exclusive 이므로 마지막 OOS 일 포함을 위해 +1일 상한 지정 (미래 구간 누수 차단)
+        end_excl = (pd.Timestamp(ds[-1]) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        data = yf.download(_BENCH[market], start=ds[0], end=end_excl, progress=False)
+        if data is None or getattr(data, "empty", True) or "Close" not in data:
+            return None
+        close_col = data["Close"]
+        if isinstance(close_col, pd.DataFrame):
+            if close_col.shape[1] == 0:
+                return None
+            close_col = close_col.iloc[:, 0]
+        closes = [float(x) for x in close_col.dropna().values if math.isfinite(float(x)) and float(x) > 0]
         if len(closes) < 5:
-            return 0.10
+            return None
         return reward.max_drawdown(closes)
     except Exception as e:
-        logger.warning("[%s] 벤치마크 MDD 실패(기본 0.10): %s", market, e)
-        return 0.10
+        logger.warning("[%s] 벤치마크 MDD 실패(fail-closed None): %s", market, e)
+        return None
 
 
 # ── 진입점 ────────────────────────────────────────────────────────────────────
@@ -195,11 +206,20 @@ def run_market(market: str) -> str:
         return (f"{flag} 단기 {market.upper()} — 표본 {len(rows)}/{MIN_SAMPLES} 콜드스타트"
                 + (f" · ⚠️orphan {len(orphans)}" if orphans else ""))
 
-    idx_mdd = _index_mdd(market, [r.get("date", "") for r in rows])
+    idx_cache: dict[tuple[str, ...], float | None] = {}
+
+    def _eval_with_oos_index_mdd(oos, params):
+        res = eval_policy(oos, params, market)
+        oos_dates = tuple(sorted({str(r.get("date", ""))[:10] for r in oos if r.get("date")}))
+        if oos_dates not in idx_cache:
+            idx_cache[oos_dates] = _index_mdd(market, list(oos_dates))
+        res["index_mdd"] = idx_cache[oos_dates]
+        return res
+
     out = learner.refit_and_adopt(
         rows, ip.get_policy(market), make_fit(market),
-        lambda oos, params: eval_policy(oos, params, market),
-        index_mdd=idx_mdd, min_samples=MIN_SAMPLES, embargo=1,   # 당일 청산 — 라벨 수평선 1일
+        _eval_with_oos_index_mdd,
+        index_mdd=None, min_samples=MIN_SAMPLES, embargo=1,   # 당일 청산 — 라벨 수평선 1일
         trial_log=learner.trial_history(f"{market}_intraday"))
     logger.info("[%s] 재학습: %s", market, out["reason"])
     evolution.record_learning(f"{market}_intraday", {

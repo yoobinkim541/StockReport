@@ -338,10 +338,21 @@ def train_ranker(
         int(valid.sum()), train_dates.max().date(), metric("mean_ic"),
         metric("top_decile_excess") * 100, metric("transaction_cost") * 100,
     )
+    ds_meta = dataset.get("meta") or {}
+    forward_days = int(ds_meta.get("forward_days") or 20)
+    # build_ml_dataset 은 'benchmark' 키를 기록한다 (하위호환으로 'benchmark_ticker' 도 허용).
+    benchmark = str(ds_meta.get("benchmark") or ds_meta.get("benchmark_ticker") or "")
+    mode_tag = str(ds_meta.get("mode") or "")
+    # surface 는 명시적 지정(예: 'investment_report')이 없을 때 기본 'us_ranker'/'kr_ranker' 를
+    # 기록해 recommendation_surfaces 의 active 모드 승격은 의도적 표면 일치 시에만 열리도록 유지한다.
+    surface = ds_meta.get("surface") or (
+        "kr_ranker" if (benchmark == "^KS11" or mode_tag.startswith("kr")) else "us_ranker"
+    )
+    train_end_str = str(train_dates.max().date())
     return RankerResult(
         model=model,
         feature_names=feat_names,
-        train_end_date=str(train_dates.max().date()),
+        train_end_date=train_end_str,
         oos_ic=metric("mean_ic"),
         oos_icir=metric("icir"),
         oos_top_decile_ret=metric("top_decile_excess"),
@@ -352,6 +363,9 @@ def train_ranker(
             "backend_label": gbdt.backend_label(backend),
             "model_type": type(model).__name__,
             "use_ranker": bool(use_ranker),
+            "surface": surface,
+            "horizon": f"{forward_days}d",
+            "model_version": f"{surface}-{backend}-{train_end_str}",
             "fit_scope": "all_labeled",
             "n_train": int(valid.sum()),
             "n_tickers": features.index.get_level_values("ticker").nunique(),
@@ -882,6 +896,17 @@ def rank_today(
         except Exception as e:
             logger.warning("지수 다중TF RSI(추론) 생성 실패: %s", e)
 
+    sector_map: dict[str, int] = {}
+    if "sector_id" in result.feature_names:
+        try:
+            from ml.data_pipeline import _get_sector_map
+            sector_map = _get_sector_map(tickers)
+        except Exception as e:
+            logger.warning("섹터 매핑(추론) 실패: %s", e)
+
+    from ml.features import is_non_stationary_level_col
+    uses_legacy_levels = any(is_non_stationary_level_col(c) for c in result.feature_names)
+
     rows = []
     seen: set[str] = set()
     for ticker in tickers:
@@ -892,7 +917,21 @@ def rank_today(
             df = prices.get(ticker)
             if df is None or len(df) < 60:
                 continue
-            feat = build_stock_features(ticker, df, market_feat, qqq_close=qqq_close)
+            if uses_legacy_levels:
+                try:
+                    feat = build_stock_features(
+                        ticker, df, market_feat, qqq_close=qqq_close,
+                        sector_id=sector_map.get(ticker, 0), scale_free=False,
+                    )
+                except TypeError:
+                    feat = build_stock_features(
+                        ticker, df, market_feat, qqq_close=qqq_close,
+                        sector_id=sector_map.get(ticker, 0),
+                    )
+            else:
+                feat = build_stock_features(
+                    ticker, df, market_feat, qqq_close=qqq_close, sector_id=sector_map.get(ticker, 0),
+                )
             if feat is None or getattr(feat, "empty", True):
                 continue
             # inf 는 dropna 가 남긴다. 비유한 피처 행을 빼고 남은 완결 행 중 가장 늦은 관측을 쓴다.

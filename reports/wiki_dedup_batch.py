@@ -14,11 +14,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,7 +29,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from agent_console import wiki
+import safe_io
+from agent_console import shared_memory, wiki
+from lib import llm_cli
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -62,14 +67,26 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(union) if union else 0.0
 
 
+def _entity_identity_tags(page: dict) -> set[str]:
+    """같은 개체/종목을 가리키는 정규 태그(entity:*, ticker:*) 추출."""
+    out: set[str] = set()
+    for tag in page.get("tags") or []:
+        clean = str(tag or "").strip().lower()
+        if clean.startswith("ticker:"):
+            val = clean.split(":", 1)[1].strip()
+            if val:
+                out.add(f"ticker:{val}")
+        elif clean.startswith("entity:"):
+            val = clean.split(":", 1)[1].strip()
+            if len(val) >= 2:
+                out.add(f"entity:{val}")
+    return out
+
+
 def find_candidate_pairs(
     pages: list[dict], *, min_similarity: float = _CANDIDATE_MIN_SIMILARITY
 ) -> list[tuple[dict, dict, float]]:
-    """같은 surface와 kind 안에서 유사한 활성 판단카드 쌍을 반환한다.
-
-    후보 추림은 LLM 호출 전 단계이며, 최종 병합 여부는 ``_judge_pair``가 결정한다.
-    ``wiki._tokens``는 기존 위키 검색과 같은 600자 정규화 규칙을 사용한다.
-    """
+    """같은 surface와 kind 안에서 유사하거나 동일 entity/ticker 태그를 공유하는 활성 판단카드 쌍."""
     eligible = [
         page
         for page in (pages or [])
@@ -89,13 +106,16 @@ def find_candidate_pairs(
             wiki._tokens(f"{page.get('title', '')} {page.get('body', '')}")
             for page in group
         ]
+        entity_sets = [_entity_identity_tags(page) for page in group]
         for index, page in enumerate(group):
             for other_index in range(index + 1, len(group)):
                 other = group[other_index]
                 score = _jaccard(token_sets[index], token_sets[other_index])
+                shared_entity = bool(entity_sets[index] & entity_sets[other_index])
+                effective = max(score, _CANDIDATE_MIN_SIMILARITY) if shared_entity else score
                 # 서버 병합 가드(wiki.merge_trust_blocker)가 거부할 쌍에 판정 호출을 쓰지 않는다.
-                if score >= min_similarity and not wiki.merge_trust_blocker([page, other]):
-                    pairs.append((page, other, score))
+                if effective >= min_similarity and not wiki.merge_trust_blocker([page, other]):
+                    pairs.append((page, other, round(effective, 4)))
     pairs.sort(key=lambda item: item[2], reverse=True)
     return pairs
 
@@ -148,16 +168,85 @@ def _build_dedup_prompt(page_a: dict, page_b: dict) -> str:
     )
 
 
-def _judge_pair(page_a: dict, page_b: dict, llm_fn) -> tuple[bool, str]:
+def _judge_pair_with_status(page_a: dict, page_b: dict, llm_fn) -> tuple[bool, str, bool]:
+    """(should_merge, reason, valid_judgment). LLM 실패·파싱 오류 시 valid=False로 suppression 저장을 막는다."""
     try:
         response = llm_fn(_build_dedup_prompt(page_a, page_b))
     except Exception as exc:
         logger.warning("중복 판정 LLM 호출 실패 (%s, %s): %s", page_a.get("id"), page_b.get("id"), exc)
-        return False, str(exc)
+        return False, str(exc), False
     parsed = _parse_dedup_judgment(response)
     if not parsed:
-        return False, "invalid dedup judgment JSON"
-    return bool(parsed["merge"]), str(parsed.get("reason") or "")
+        return False, "invalid dedup judgment JSON", False
+    return bool(parsed["merge"]), str(parsed.get("reason") or ""), True
+
+
+def _judge_pair(page_a: dict, page_b: dict, llm_fn) -> tuple[bool, str]:
+    should_merge, reason, _valid = _judge_pair_with_status(page_a, page_b, llm_fn)
+    return should_merge, reason
+
+
+_SUPPRESSION_FILENAME = "dedup-judgments.json"
+_SUPPRESSION_MAX_ENTRIES = 5000
+
+
+def _suppression_path() -> Path:
+    return Path(shared_memory.shared_memory_dir()) / _SUPPRESSION_FILENAME
+
+
+def _page_content_digest(page: dict) -> str:
+    payload = json.dumps(
+        [str(page.get("title") or ""), str(page.get("summary") or ""), str(page.get("body") or "")],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _pair_key(id_a: str, id_b: str) -> str:
+    return "|".join(sorted((id_a, id_b)))
+
+
+def _pair_signature(page_a: dict, page_b: dict) -> str:
+    items = sorted([
+        (str(page_a.get("id") or ""), _page_content_digest(page_a)),
+        (str(page_b.get("id") or ""), _page_content_digest(page_b)),
+    ])
+    return f"{items[0][1]}:{items[1][1]}"
+
+
+def _load_suppressions() -> dict[str, dict]:
+    path = _suppression_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def _save_suppressions(
+    updates: dict[str, dict],
+    *,
+    removals: set[str] | None = None,
+) -> None:
+    path = _suppression_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with safe_io.file_write_lock(str(path), timeout=5.0):
+        merged = _load_suppressions()
+        for key in removals or ():
+            merged.pop(key, None)
+        merged.update(updates)
+        if len(merged) > _SUPPRESSION_MAX_ENTRIES:
+            ordered = sorted(
+                merged.items(),
+                key=lambda item: str(item[1].get("judged_at") or ""),
+                reverse=True,
+            )[:_SUPPRESSION_MAX_ENTRIES]
+            merged = dict(ordered)
+        safe_io.atomic_write_json(str(path), merged)
 
 
 def _confidence(page: dict) -> float:
@@ -193,16 +282,22 @@ def _dedup_max_judgments() -> int:
 
 
 def run(*, dry_run: bool = False, llm_fn=None, limit: int | None = None) -> dict:
-    """후보 쌍을 판정하고, 확인된 쌍만 한 번씩 병합한다."""
-    if llm_fn is None:
-        from agent_console.agent import _try_llm_prompt
+    """후보 쌍을 판정하고, 확인된 쌍만 한 번씩 병합한다.
 
-        llm_fn = _try_llm_prompt
+    이미 ``merge=false`` 로 판정된 쌍은 두 페이지 본문·제목·요약 다이제스트가 바뀌기 전까지
+    LLM 재호출을 건너뛰어 유지보수 쿼터 소모를 줄인다.
+    """
+    if llm_fn is None:
+        llm_fn = llm_cli.default_maintenance_llm_fn()
 
     pages = wiki._all_wiki_pages()
     batch_size = _dedup_batch_size() if limit is None else max(1, min(50, int(limit)))
     pairs = find_candidate_pairs(pages)
     max_judgments = _dedup_max_judgments()
+    suppressions = _load_suppressions()
+    suppression_updates: dict[str, dict] = {}
+    suppression_removals: set[str] = set()
+    suppressed = 0
     merged_away: set[str] = set()
     merged: list[dict] = []
     pairs_considered = 0
@@ -214,12 +309,26 @@ def run(*, dry_run: bool = False, llm_fn=None, limit: int | None = None) -> dict
         page_b_id = str(page_b.get("id") or "")
         if not page_a_id or not page_b_id or page_a_id in merged_away or page_b_id in merged_away:
             continue
+        pkey = _pair_key(page_a_id, page_b_id)
+        psig = _pair_signature(page_a, page_b)
+        if suppressions.get(pkey, {}).get("sig") == psig:
+            suppressed += 1
+            continue
         if pairs_considered >= max_judgments:
             logger.info("판정 상한 도달(%d회, 병합 %d건) — 남은 후보는 다음 실행에서", max_judgments, len(merged))
             break
         pairs_considered += 1
-        should_merge, reason = _judge_pair(page_a, page_b, llm_fn)
+        should_merge, reason, valid = _judge_pair_with_status(page_a, page_b, llm_fn)
         if not should_merge:
+            if valid and not dry_run:
+                entry_sup = {
+                    "sig": psig,
+                    "reason": reason[:200],
+                    "judged_at": datetime.now(timezone.utc).isoformat(),
+                }
+                suppressions[pkey] = entry_sup
+                suppression_updates[pkey] = entry_sup
+                suppression_removals.discard(pkey)
             continue
         target, source = _pick_target_source(page_a, page_b)
         entry = {
@@ -236,14 +345,23 @@ def run(*, dry_run: bool = False, llm_fn=None, limit: int | None = None) -> dict
         if result:
             merged.append(entry)
             merged_away.add(str(source.get("id") or ""))
+            if suppressions.pop(pkey, None) is not None:
+                suppression_removals.add(pkey)
+                suppression_updates.pop(pkey, None)
         else:
             logger.warning("위키 병합 실패: target=%s source=%s", target.get("id"), source.get("id"))
 
     if merged and not dry_run:
         wiki.rebuild_artifacts()
+    if (suppression_updates or suppression_removals) and not dry_run:
+        try:
+            _save_suppressions(suppression_updates, removals=suppression_removals)
+        except Exception as exc:
+            logger.warning("dedup suppression 저장 실패 (병합 아티팩트는 반영됨): %s", exc)
     return {
         "dry_run": bool(dry_run),
         "pairs_considered": pairs_considered,
+        "suppressed": suppressed,
         "merged": merged,
     }
 

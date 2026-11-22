@@ -54,10 +54,12 @@ def portfolio_stocks() -> list[str]:
         return list(DEFAULT_PORTFOLIO_STOCKS)
     tickers: list[str] = []
     for sec in ("overseas_general", "overseas_fractional"):
-        for h in snap.get(sec, {}).get("holdings_usd", []) or []:
-            t = str(h.get("ticker") or "").strip().upper()
-            if t and t not in tickers:
-                tickers.append(t)
+        block = snap.get(sec, {}) or {}
+        for key in ("holdings_usd", "holdings"):
+            for h in block.get(key, []) or []:
+                t = str(h.get("ticker") or "").strip().upper()
+                if t and t not in tickers:
+                    tickers.append(t)
     return tickers or list(DEFAULT_PORTFOLIO_STOCKS)
 
 ALERT_STATE_PATH = Path(os.path.expanduser("~/.cache/entry_alert_state.json"))
@@ -350,8 +352,13 @@ def compute_entry_score(
     # 1. 승률
     win_s = max(0.0, min(1.0, (win_20 - 0.3) / 0.5))
 
-    # 2. 손익비
-    rr   = abs(exp_20 / p25_20) if p25_20 < 0 and np.isfinite(p25_20) else 1.0
+    # 2. 손익비 (기대수익 ≤ 0 또는 비유한이면 손익비 0 — abs() 부호 반전 버그 방지)
+    if not np.isfinite(exp_20) or exp_20 <= 0:
+        rr = 0.0
+    elif p25_20 < 0 and np.isfinite(p25_20):
+        rr = float(exp_20) / abs(float(p25_20))
+    else:
+        rr = 1.0
     rr_s = max(0.0, min(1.0, (rr - 0.5) / 2.5))
 
     # 3. RSI 과매도 보너스

@@ -80,9 +80,19 @@ def extract_features(fund: dict | None, earnings: dict | None, sig: dict | None)
 
     per = float(earnings.get("per", 0) or 0)
     pbr = float(earnings.get("pbr", 0) or 0)
-    if per > 0 or pbr > 0:                                  # 저PER/저PBR = 높은 밸류점수
-        v_per = (1.0 - min(per, 40.0) / 40.0) if per > 0 else 0.5
-        v_pbr = (1.0 - min(pbr, 10.0) / 10.0) if pbr > 0 else 0.5
+    if per != 0 or pbr != 0:                                # 저PER/저PBR = 높은 밸류, 적자(PER<0) = 0 페널티
+        if per > 0:
+            v_per = 1.0 - min(per, 40.0) / 40.0
+        elif per < 0:
+            v_per = 0.0
+        else:
+            v_per = 0.5
+        if pbr > 0:
+            v_pbr = 1.0 - min(pbr, 10.0) / 10.0
+        elif pbr < 0:
+            v_pbr = 0.0
+        else:
+            v_pbr = 0.5
         value = _clamp01(0.5 * v_per + 0.5 * v_pbr)
     else:
         value = 0.5
@@ -124,11 +134,17 @@ def pead_axis(events: list[dict], closes=None, asof=None) -> float | None:
     """
     try:
         import pandas as pd
-        ts = pd.Timestamp(asof) if asof is not None else pd.Timestamp.now().normalize()
+        ts = pd.Timestamp(asof) if asof is not None else pd.Timestamp.now()
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        ts = ts.normalize()
         ev = None
         for e in (events or []):
             try:
                 d = pd.Timestamp(str(e.get("date", ""))[:10])
+                if d.tzinfo is not None:
+                    d = d.tz_localize(None)
+                d = d.normalize()
             except Exception:
                 continue
             if d <= ts and e.get("surprise_pct") is not None:
@@ -143,8 +159,9 @@ def pead_axis(events: list[dict], closes=None, asof=None) -> float | None:
         comp = [max(-1.0, min(1.0, surp / 10.0))]
         if closes is not None:
             try:
-                c = closes.dropna()
-                c.index = pd.to_datetime(c.index).tz_localize(None)
+                c = closes.dropna().copy()
+                c.index = pd.to_datetime(c.index).tz_localize(None).normalize()
+                c = c[c.index <= ts]                             # 룩어헤드 방지: asof 이후 종가 차단
                 before = c[c.index <= d]
                 after = c[c.index > d]
                 if len(before) and len(after):

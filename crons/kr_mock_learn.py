@@ -63,7 +63,7 @@ def fit_policy(train_rows: list[dict]) -> dict:
       랭킹이 유니버스 순서로 붕괴하는 것 방지(#12).
     """
     from ml import kr_policy
-    from ml.adaptive.learner import NEW_AXIS_MIN_PAIRS, robust_axis_weight
+    from ml.adaptive.learner import NEW_AXIS_MIN_PAIRS, fit_multivariate_axis_weights, robust_axis_weight
     _NEW_AXES = {"mom12", "hi52", "lowvol", "news"}  # 원장 축적 초기 축 — 강화 게이트(E)
     measured = {}
     for f in _FEATS:
@@ -78,6 +78,11 @@ def fit_policy(train_rows: list[dict]) -> dict:
     if total <= 1e-9:
         # 신호 없음(또는 전축 미측정) → 합리적 기본 혼합 유지(붕괴 방지)
         return {f"w_{f}": kr_policy.DEFAULT_POLICY[f"w_{f}"] for f in _FEATS}
+    eligible = [f for f in _FEATS if measured.get(f, 0.0) > 0.0]
+    if len(eligible) >= 2 and len(train_rows) >= 15:
+        ridge_w = fit_multivariate_axis_weights(train_rows, eligible, l2=1.0, min_rows=15)
+        if ridge_w and sum(ridge_w.values()) > 1e-9:
+            return {f"w_{f}": round(ridge_w.get(f, 0.0), 4) for f in _FEATS}
     return {f"w_{f}": round(measured.get(f, 0.0) / total, 4) for f in _FEATS}
 
 
@@ -174,6 +179,14 @@ def backfill_outcomes(ledger, *, horizon: int = HORIZON, window_fn=None,
 from lib.cron_common import send_cron_telegram
 
 
+def filter_stock_policy_rows(rows: list[dict]) -> list[dict]:
+    """장점 앙상블·스위트스팟 등 타 전략 레짐 행을 종목정책 학습셋에서 제외한다."""
+    return [
+        r for r in rows
+        if r.get("strategy_regime") in (None, "", "kr_mock")
+    ]
+
+
 def main() -> int:
     logger.info("=== kr_mock_learn 시작 [%s] ===", datetime.now(KST).strftime("%Y-%m-%d %H:%M"))
     if not kiwoom_mock.is_enabled():
@@ -206,7 +219,7 @@ def main() -> int:
         llm_exec.shadow_training_set(llm_ledger), horizon=llm_exec.report_horizon())
     logger.info("LLM shadow 백필: %d건 성숙 · %s", llm_added, llm_exec.summary_line(llm_summary))
 
-    rows = ledger.training_set()
+    rows = filter_stock_policy_rows(ledger.training_set())
     from ml.adaptive import evolution
     snap = evolution.snapshot(rows)
     if len(rows) < MIN_SAMPLES:

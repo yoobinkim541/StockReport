@@ -115,13 +115,17 @@ def _get_excess_signal() -> float:
         X = features_df.values.astype(float)
         y = label.values
 
-        # ── Expanding Walk-Forward (최소 학습 60일, 예측 20일 단위 슬라이딩) ──
+        # ── Purged Expanding Walk-Forward (embargo=20: shift(-20) 라벨 누수 차단) ──
+        # row i 의 라벨은 close[i+20] 을 참조하므로 학습은 [:end - 20] 까지만 허용한다.
+        # (마지막 학습행 end - 21 의 라벨 종점은 end - 1 < end → 테스트 구간과 0일 겹침)
+        embargo = 20
         min_train = min(60, n // 3)
         preds = np.full(n, np.nan)
 
-        for end in range(min_train, n - 20, 20):
+        for end in range(min_train + embargo, n - 20, 20):
             model = ExcessReturnModel()
-            X_tr, y_tr = X[:end], y[:end]
+            train_end = end - embargo
+            X_tr, y_tr = X[:train_end], y[:train_end]
             valid = np.isfinite(X_tr).all(axis=1) & np.isfinite(y_tr)
             if valid.sum() < 30:
                 continue
@@ -170,9 +174,13 @@ def _get_fg_signal() -> float:
 
 
 def _get_phase_signal(market_type: str, phase_key) -> float:
-    """Phase → -1(안전 극대화) ~ +1(공격 극대화)."""
+    """Phase → -1(안전 극대화) ~ +1(공격 극대화).
+
+    bull_1(건전 상승)은 완만한 risk_on, bull_2(과열/버블)는 방어(음수).
+    """
     if market_type == "bull":
-        return {"bull2": 0.8, "bull1": 0.5}.get(str(phase_key), 0.3)
+        key = str(phase_key).strip().lower()
+        return {"bull_1": 0.3, "bull1": 0.3, "bull_2": -0.3, "bull2": -0.3}.get(key, 0.1)
     if market_type == "bear":
         # 하락장에서는 낙폭이 클수록 매수 기회 → 공격적
         return {0: 0.0, 1: -0.2, 2: -0.1, 3: 0.1, 4: 0.3, 5: 0.5}.get(phase_key, 0.0)
@@ -186,12 +194,22 @@ def _determine_regime(
     fg:     float,
     phase:  float,
     lev_sgov: float,
+    sw: Optional[SignalWeights] = None,
 ) -> tuple[str, float]:
-    """4개 신호 합의도 → 체제 + 신뢰도."""
+    """4개 신호 가중 합의도 → 체제 + 신뢰도."""
+    w = sw or SignalWeights()
     # risk_on 신호 수집 (양수 = 공격적)
-    signals = [excess, fg, phase, 1 - lev_sgov * 2]   # SGOV 높으면 음수
-    mean_s  = float(np.mean(signals))
-    std_s   = float(np.std(signals))
+    signals = np.array([excess, fg, phase, 1.0 - lev_sgov * 2.0], dtype=float)
+    weights = np.array([max(0.0, w.excess), max(0.0, w.fg_proxy), max(0.0, w.phase), max(0.0, w.leverage)], dtype=float)
+    w_sum = float(weights.sum())
+    if w_sum > 0:
+        weights = weights / w_sum
+        mean_s = float(np.dot(weights, signals))
+        var_s = float(np.dot(weights, (signals - mean_s) ** 2))
+        std_s = float(np.sqrt(max(0.0, var_s)))
+    else:
+        mean_s = float(np.mean(signals))
+        std_s = float(np.std(signals))
     confidence = max(0.0, 1.0 - std_s)   # 신호 일치할수록 높음
 
     if mean_s > 0.15:
@@ -364,6 +382,7 @@ def _get_meta_allocation_impl(
     regime, confidence = _determine_regime(
         excess=excess_sig, fg=fg_sig,
         phase=phase_sig,   lev_sgov=lev_weights.get("SGOV", 0.5),
+        sw=sw,
     )
 
     weights = _build_weights(regime, ranker_scores, lev_weights, excess_sig, sw)

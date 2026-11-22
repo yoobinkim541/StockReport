@@ -568,15 +568,15 @@ def _phase_blend_factor(market_type: str, phase_key) -> float:
     """Phase에 따라 ML 블렌딩 강도를 동적으로 결정.
 
     고평가(Bull-2)일수록 ML 영향 최소화,
-    급락(Bear 3~5)일수록 ML 방향성 신뢰도 높여 강하게 반영.
+    하락장(Bear 3~5)에서도 미검증 알파 과신 방지를 위해 기본 상한을 0.25로 보수적으로 유지.
     (옵트인 시 advice 적응 shadow 가 입증된 meta 쪽으로 blend 를 0.6 상한 내에서 상향.)
     """
     if market_type == "bull":
         base = {"bull_2": 0.1, "bull_1": 0.2}.get(str(phase_key), 0.25)
     elif market_type == "bear":
-        base = {0: 0.3, 1: 0.35, 2: 0.45, 3: 0.55, 4: 0.60, 5: 0.60}.get(phase_key, 0.3)
+        base = {0: 0.2, 1: 0.2, 2: 0.25, 3: 0.25, 4: 0.25, 5: 0.25}.get(phase_key, 0.2)
     else:
-        base = 0.3   # neutral
+        base = 0.2   # neutral
     return _adaptive_advice_blend(base)
 
 
@@ -611,13 +611,29 @@ def _ml_dca_blend(
             alloc = get_meta_allocation(market_type, phase_key)
             meta_weights = alloc.weights   # {ticker: float}
 
-            # MetaAllocator 비중이 있으면 blend
+            # MetaAllocator 비중이 있으면 base_weights 주식 슬리브 키만으로 재정규화해 블렌딩
+            # (SGOV/QQQI/레버리지 포함 전체 포트폴리오 스케일을 그대로 섞으면 비하드코딩 종목 비중이 부풀려짐)
             if meta_weights:
+                import math
                 blend = _phase_blend_factor(market_type, phase_key)
+
+                def _finite_pos(val) -> float:
+                    try:
+                        f = float(val)
+                        return f if math.isfinite(f) and f > 0.0 else 0.0
+                    except (TypeError, ValueError):
+                        return 0.0
+
+                overlap = [t for t in base_weights if t not in NON_EQUITY and t in meta_weights]
+                meta_overlap_sum = sum(_finite_pos(meta_weights[t]) for t in overlap)
+                base_overlap_sum = sum(_finite_pos(base_weights[t]) for t in overlap)
                 blended: dict[str, float] = {}
                 for t in base_weights:
-                    base = base_weights[t]
-                    ml_w = meta_weights.get(t, base)
+                    base = _finite_pos(base_weights[t])
+                    if t in overlap and meta_overlap_sum > 0 and base_overlap_sum > 0:
+                        ml_w = (_finite_pos(meta_weights[t]) / meta_overlap_sum) * base_overlap_sum
+                    else:
+                        ml_w = base
                     blended[t] = base * (1 - blend) + ml_w * blend
 
                 total = sum(blended.values())
@@ -640,11 +656,14 @@ def _ml_dca_blend(
     # ── 2. Ranker fallback ────────────────────────────────────────────────
     try:
         import numpy as np, pandas as pd
-        from ml.ranker import load_ranker
-        from ml.data_pipeline import fetch_prices, build_stock_features, build_fear_greed_proxy
+        from ml.ranker import load_ranker, ranker_gate
+        from ml.data_pipeline import (
+            fetch_prices, build_stock_features, build_fear_greed_proxy,
+            index_multitf_rsi, _get_sector_map,
+        )
 
         result = load_ranker()
-        if result is None:
+        if result is None or not ranker_gate(result).get("passed"):
             return base_weights, {}, 0.0
 
         equity = [t for t in base_weights if t not in NON_EQUITY]
@@ -657,22 +676,53 @@ def _ml_dca_blend(
             mkt["vix"] = prices["^VIX"]["Close"]
         mkt       = mkt.ffill()
         qqq_close = prices.get("QQQ", pd.DataFrame()).get("Close")
+        if qqq_close is not None:
+            try:
+                mkt = mkt.join(index_multitf_rsi(qqq_close), how="left").ffill()
+            except Exception as e:
+                _logger.warning("지수 다중TF RSI(DCA 추론) 생성 실패: %s", e)
+
+        sector_map: dict[str, int] = {}
+        if "sector_id" in result.feature_names:
+            try:
+                sector_map = _get_sector_map(equity)
+            except Exception as e:
+                _logger.warning("섹터 매핑(DCA 추론) 실패: %s", e)
+
+        from ml.features import is_non_stationary_level_col
+        uses_legacy_levels = any(is_non_stationary_level_col(c) for c in result.feature_names)
 
         scores: dict[str, float] = {}
         for ticker in equity:
             df = prices.get(ticker)
             if df is None or len(df) < 60:
                 continue
-            feat = build_stock_features(ticker, df, mkt, qqq_close=qqq_close)
-            if feat.empty:
+            if uses_legacy_levels:
+                try:
+                    feat = build_stock_features(
+                        ticker, df, mkt, qqq_close=qqq_close,
+                        sector_id=sector_map.get(ticker, 0), scale_free=False,
+                    )
+                except TypeError:
+                    feat = build_stock_features(
+                        ticker, df, mkt, qqq_close=qqq_close,
+                        sector_id=sector_map.get(ticker, 0),
+                    )
+            else:
+                feat = build_stock_features(
+                    ticker, df, mkt, qqq_close=qqq_close, sector_id=sector_map.get(ticker, 0),
+                )
+            if feat is None or getattr(feat, "empty", True):
                 continue
-            clean = feat.dropna()
+            clean = feat.reindex(columns=result.feature_names).replace([np.inf, -np.inf], np.nan).dropna()
             if clean.empty:
                 continue
-            row = clean.iloc[-1].reindex(result.feature_names)
-            if row.isna().any():
-                continue
-            scores[ticker] = float(result.model.predict(row.to_frame().T)[0])
+            if not clean.index.is_monotonic_increasing:
+                clean = clean.sort_index()
+            row = clean.iloc[-1]
+            pred = float(result.model.predict(row.to_frame().T)[0])
+            if np.isfinite(pred):
+                scores[ticker] = pred
 
         if not scores:
             return base_weights, {}, 0.0
@@ -799,6 +849,7 @@ def calculate_dca(market_type: str, phase_key, exchange_rate: float = 1380.0,
         "ml_scores":     ml_scores,
         "ml_breadth":    round(breadth * 100, 3),   # % 단위
         "ml_direction":  ml_direction,
+        "weights":       ml_weights,
         "by_ticker":     allocation,
         "base_by_ticker": base_alloc,
         "exchange_rate": exchange_rate,
@@ -916,15 +967,18 @@ def calculate_safety_margin(portfolio: dict, market_type: str, phase_key) -> dic
     score   = 70.0   # 기본점수
     factors = {}
 
-    # ── 1. 종목 집중도 (HHI) ─────────────────────────────────────────
-    stock_ws = []
+    # ── 1. 종목 집중도 (HHI — 주식 슬리브 합계 기준 정규화) ────────────────
+    stock_vals = []
     for t, sh in holdings.items():
         # SPMO는 모멘텀 팩터 ETF — 분산 효과가 제한적이므로 집중도 계산에 포함
         if t in ("SGOV", "QQQI", "QLD", "TQQQ", "BIL", "SHV"):
             continue
         p = prices.get(t, 0)
-        if p > 0:
-            stock_ws.append(sh * p / total)
+        if p > 0 and sh > 0:
+            stock_vals.append(sh * p)
+
+    equity_total = sum(stock_vals)
+    stock_ws = [v / equity_total for v in stock_vals] if equity_total > 0 else []
 
     if stock_ws:
         hhi = sum(w ** 2 for w in stock_ws)
@@ -1028,8 +1082,15 @@ def calculate_smart_rebalancing(
     adj_total_krw = int(base_dca["total_krw"] * adj_mult)
 
     # 비중 불균형 반영하여 종목별 DCA 가중치 재조정
-    w_normal, _ = load_dca_weights()
-    adj_weights  = dict(w_normal)
+    # calculate_dca가 산출한 phase(w_bear/w_normal)+ML 블렌드 비중을 보존한다.
+    if base_dca.get("weights"):
+        adj_weights = dict(base_dca["weights"])
+    elif base_dca.get("by_ticker") and sum(base_dca["by_ticker"].values()) > 0:
+        tot_bt = sum(base_dca["by_ticker"].values())
+        adj_weights = {t: v / tot_bt for t, v in base_dca["by_ticker"].items()}
+    else:
+        w_normal, w_bear = load_dca_weights()
+        adj_weights = dict(w_bear if (market_type == "bear" and isinstance(phase_key, int) and phase_key >= 2) else w_normal)
 
     for pos in positions:
         t = pos["ticker"]
@@ -1614,13 +1675,29 @@ def calculate_rebalancing(
     sgov_target  = total * sgov_target_r
     sgov_diff    = sgov_target - sgov
     sgov_pct_now = sgov / total * 100 if total > 0 else 0
+    import math
+    prices_raw   = portfolio.get("prices")
+    prices       = prices_raw if isinstance(prices_raw, dict) else {}
+    sgov_px_raw  = prices.get("SGOV")
+    sgov_price   = SGOV_FALLBACK_PRICE
+    if sgov_px_raw is not None and not isinstance(sgov_px_raw, bool):
+        try:
+            _px = float(sgov_px_raw)
+            if math.isfinite(_px) and _px > 0:
+                sgov_price = _px
+        except (TypeError, ValueError):
+            pass
+    deploy_allowed = (market_type == "bear" and isinstance(phase_key, int) and phase_key >= 2)
 
     if sgov_diff > 50:
-        sgov_act = f"매수 ${sgov_diff:.0f}  ({int(sgov_diff / 100.67)}주 SGOV)"
+        sgov_act = f"매수 ${sgov_diff:.0f}  ({int(sgov_diff / sgov_price)}주 SGOV)"
         sgov_dir = "buy"
-    elif sgov_diff < -50:
+    elif sgov_diff < -50 and deploy_allowed:
         sgov_act = f"매도 ${abs(sgov_diff):.0f}  → DCA/레버리지 전환"
         sgov_dir = "sell"
+    elif sgov_diff < -50:
+        sgov_act = f"목표 이상 확보 (+${abs(sgov_diff):.0f}, 비축 유지)"
+        sgov_dir = "hold"
     else:
         sgov_act = "적정 수준 유지"
         sgov_dir = "hold"
@@ -1628,7 +1705,6 @@ def calculate_rebalancing(
     # 레버리지 현황
     leverage = load_leverage_state()
     lev_lines = []
-    prices    = portfolio.get("prices", {})
     for ticker, pos in leverage.items():
         sh = pos.get("shares", 0)
         if sh > 0:

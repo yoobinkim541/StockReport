@@ -177,6 +177,107 @@ def robust_axis_weight(pairs: list, *, min_pairs: int = 5, stability: bool = Fal
     return full if (first > 0 and second > 0) else 0.0
 
 
+def fit_multivariate_axis_weights(
+    rows: list[dict],
+    axes: tuple[str, ...] | list[str],
+    *,
+    l2: float = 1.0,
+    min_rows: int = 15,
+    target_key: str = "fwd_excess",
+) -> dict[str, float]:
+    """공선 축 중복 가중을 막는 다변량 비음수 Ridge 축 가중치 추정 (합 1.0 정규화).
+
+    단변량 피어슨(`robust_axis_weight`)은 서로 상관된 모멘텀 축들(mom/mom12/hi52/ranker)을
+    각각 중복 계상해 직교 축을 압도한다. 표준화 설계행렬에 L2 규제를 걸어 공선 축 가중을
+    자연스럽게 분배하고 음수 계수는 0으로 투영(활성 양수 집합 1회 재적합)한다.
+    """
+    import numpy as np
+
+    axis_list = list(dict.fromkeys(axes))
+    if not axis_list or len(rows) < min_rows:
+        return {}
+    l2_eff = float(l2) if (not isinstance(l2, bool) and _finite(l2)) else 1.0
+    l2_eff = max(1e-6, l2_eff)
+
+    ys: list[float] = []
+    raw_cols: list[list[float | None]] = [[] for _ in axis_list]
+    for r in rows:
+        y_val = r.get(target_key)
+        if y_val is None or isinstance(y_val, bool) or not _finite(y_val):
+            continue
+        feats = r.get("features") or {}
+        ys.append(float(y_val))
+        for j, ax in enumerate(axis_list):
+            v = feats.get(ax)
+            raw_cols[j].append(float(v) if (v is not None and not isinstance(v, bool) and _finite(v)) else None)
+
+    n = len(ys)
+    if n < min_rows:
+        return {}
+
+    def _safe_zscore_params(vals: list[float]) -> tuple[float, float, float] | None:
+        arr = np.asarray(vals, dtype=float)
+        scale = float(np.max(np.abs(arr)))
+        if not math.isfinite(scale) or scale <= 0.0:
+            return None
+        scaled = arr / scale
+        mean_s = float(np.mean(scaled))
+        std_s = float(np.std(scaled))
+        if not (math.isfinite(mean_s) and math.isfinite(std_s)) or std_s <= 1e-12:
+            return None
+        return scale, mean_s, std_s
+
+    p = len(axis_list)
+    X = np.zeros((n, p), dtype=float)
+    active_cols: list[int] = []
+    for j in range(p):
+        obs = [v for v in raw_cols[j] if v is not None]
+        if len(obs) < max(5, min_rows // 2):
+            continue
+        params_j = _safe_zscore_params(obs)
+        if params_j is None:
+            continue
+        scale_j, mean_j, std_j = params_j
+        for i, v in enumerate(raw_cols[j]):
+            X[i, j] = ((v / scale_j) - mean_j) / std_j if v is not None else 0.0
+        active_cols.append(j)
+
+    if not active_cols:
+        return {}
+
+    y_params = _safe_zscore_params(ys)
+    if y_params is None:
+        return {}
+    y_scale, y_mean_s, y_std_s = y_params
+    y_z = ((np.asarray(ys, dtype=float) / y_scale) - y_mean_s) / y_std_s
+
+    def _solve(cols: list[int]) -> np.ndarray:
+        Xm = X[:, cols]
+        gram = (Xm.T @ Xm) / n + l2_eff * np.eye(len(cols))
+        rhs = (Xm.T @ y_z) / n
+        return np.linalg.solve(gram, rhs)
+
+    beta = np.zeros(p, dtype=float)
+    sol = _solve(active_cols)
+    for idx_pos, j in enumerate(active_cols):
+        beta[j] = float(sol[idx_pos])
+
+    pos_cols = [j for j in active_cols if beta[j] > 0.0]
+    if not pos_cols:
+        return {ax: 0.0 for ax in axis_list}
+
+    # 음수 축 제거 후 양수 활성 집합에 대해 1회 재적합
+    beta_pos = np.zeros(p, dtype=float)
+    sol_pos = _solve(pos_cols)
+    for idx_pos, j in enumerate(pos_cols):
+        beta_pos[j] = max(0.0, float(sol_pos[idx_pos]))
+
+    total = float(beta_pos.sum())
+    if total <= 0.0:
+        return {ax: 0.0 for ax in axis_list}
+    return {ax: round(float(beta_pos[j] / total), 6) for j, ax in enumerate(axis_list)}
+
+
 def walk_forward_split(dates: list, *, train_frac: float = 0.6, embargo: int = 0):
     """날짜순 train/OOS 마스크. **embargo 는 고유 거래일(날짜) 단위** purge.
 

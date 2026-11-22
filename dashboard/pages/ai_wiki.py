@@ -10,7 +10,7 @@ from html import escape
 import pandas as pd
 import streamlit as st
 
-from agent_console import wiki
+from agent_console import evidence_usage, wiki
 from dashboard import cached, ui_actions, wiki_browser, wiki_ontology_view
 from dashboard.wiki_browser import KIND_LABELS, SURFACE_LABELS, build_wiki_health_model, option_label, page_display_name
 
@@ -81,9 +81,76 @@ def _section_control() -> str:
     return selected if selected in SECTIONS else SECTIONS[0]
 
 
+def build_retrieval_telemetry_model(summary: dict | None) -> dict:
+    """`evidence_usage.usage_summary()` 응답을 관리 패널 표시용 정규화 지표로 변환한다."""
+    s = summary if isinstance(summary, dict) else {}
+
+    def _int(primary: str, fallback: str = "") -> int:
+        val = s.get(primary)
+        if val is None and fallback:
+            val = s.get(fallback)
+        if isinstance(val, bool) or val is None:
+            return 0
+        try:
+            return max(0, int(val))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    retrievals = _int("retrieval_count", "retrievals")
+    queries = _int("queries", "retrieval_count") or retrievals
+    context_uses = _int("context_use_count", "context_uses")
+    answer_uses = _int("answer_use_count", "answer_uses")
+    invalid_citations = _int("invalid_citation_count", "invalid_citations")
+    fallbacks = _int("fallback_retrieval_count", "fallbacks")
+    hours = _int("hours") or 24
+
+    context_rate_pct = round(min(100.0, 100.0 * context_uses / retrievals), 1) if retrievals > 0 else 0.0
+    fallback_rate_pct = round(min(100.0, 100.0 * fallbacks / retrievals), 1) if retrievals > 0 else 0.0
+    answer_rate_pct = round(min(100.0, 100.0 * answer_uses / retrievals), 1) if retrievals > 0 else 0.0
+    providers_raw = s.get("providers")
+    providers = dict(providers_raw) if isinstance(providers_raw, dict) else {}
+
+    return {
+        "hours": hours,
+        "queries": queries,
+        "retrievals": retrievals,
+        "context_uses": context_uses,
+        "answer_uses": answer_uses,
+        "invalid_citations": invalid_citations,
+        "fallbacks": fallbacks,
+        "context_rate_pct": context_rate_pct,
+        "fallback_rate_pct": fallback_rate_pct,
+        "answer_rate_pct": answer_rate_pct,
+        "providers": providers,
+    }
+
+
+@st.cache_data(ttl=30, max_entries=4, show_spinner=False)
+def _cached_retrieval_usage(hours: int = 24) -> dict:
+    try:
+        return evidence_usage.usage_summary(hours=hours)
+    except Exception:
+        return {}
+
+
+def _retrieval_telemetry_panel() -> None:
+    raw = _cached_retrieval_usage(24)
+    tel = build_retrieval_telemetry_model(raw)
+    st.markdown(f"##### 검색·인용 텔레메트리 (최근 {tel['hours']}시간)")
+    cols = st.columns(4)
+    cols[0].metric("검색 수", f"{tel['retrievals']}")
+    cols[1].metric("컨텍스트 채택률", f"{tel['context_rate_pct']:.1f}%")
+    cols[2].metric("폴백 비율", f"{tel['fallback_rate_pct']:.1f}%")
+    cols[3].metric("무효 인용", f"{tel['invalid_citations']}")
+    if tel["providers"]:
+        prov_text = " · ".join(f"{k}: {v}" for k, v in sorted(tel["providers"].items()))
+        st.caption(f"검색 엔진 분포 · {prov_text}")
+
+
 def _management_section(proposals: list[dict]) -> None:
     _pending_curation_section(proposals)
     _pipeline_health_panel()
+    _retrieval_telemetry_panel()
 
     pages_all, search_health, lint = wiki_browser._cached_wiki_snapshot()
     health = build_wiki_health_model(pages_all, search_health=search_health, lint=lint)

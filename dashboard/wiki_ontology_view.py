@@ -15,7 +15,7 @@ TYPE_COLORS = {
     "company": "#38bdf8", "asset": "#f59e0b", "indicator": "#a78bfa", "institution": "#34d399",
     "person": "#f472b6", "region": "#94a3b8", "sector": "#fb923c", "theme": "#facc15", "event": "#f87171",
 }
-STATE_COLORS = {"asserted": "#64748b", "corroborated": "#22c55e", "contested": "#ef4444"}
+STATE_COLORS = {"asserted": "#64748b", "corroborated": "#22c55e", "contested": "#ef4444", "superseded": "#475569"}
 
 
 def build_view_model(ontology: dict | None, pages: list[dict]) -> dict:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone, timedelta
@@ -36,24 +37,83 @@ WINDOW = 90               # 트레일링 평가 표본수(≈일별 3개월)
 MIN_SAMPLES = 30          # 평가 최소 표본
 
 
-def scorecard(records: list[dict], window: int = WINDOW) -> dict | None:
-    """전략(total_usd) vs 지수(qqq_price) ★목적함수 스코어카드 — 최근 window 표본."""
-    from ml.adaptive import reward as _reward
-    rows = [r for r in records if r.get("total_usd") and r.get("qqq_price")]
-    if len(rows) < MIN_SAMPLES:
+def _pos_finite(value) -> float | None:
+    """양의 유한 실수만 통과 (NaN/inf/<=0/비수치 문자열은 None)."""
+    if value is None or isinstance(value, bool):
         return None
-    rows = rows[-window:]
-    nav = [float(r["total_usd"]) for r in rows]
-    idx = [float(r["qqq_price"]) for r in rows]
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) and f > 0.0 else None
+
+
+def _twr_by_date(account: dict | None) -> dict[str, float]:
+    """reports.account_performance.daily_account 반환값 → {'YYYY-MM-DD': twr} 매핑."""
+    if not isinstance(account, dict):
+        return {}
+    index = account.get("index")
+    twr = account.get("twr")
+    if index is None or twr is None or len(index) != len(twr):
+        return {}
+    out: dict[str, float] = {}
+    for dt, val in zip(index, twr):
+        fval = _pos_finite(val)
+        if fval is None:
+            continue
+        try:
+            key = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+        except Exception:
+            continue
+        if key:
+            out[key] = fval
+    return out
+
+
+def scorecard(records: list[dict], window: int = WINDOW, account: dict | None = None) -> dict | None:
+    """전략(TWR 우선, 미제공 시 total_usd 폴백) vs 지수(qqq_price) ★목적함수 스코어카드.
+
+    입금/출금이 누적되는 total_usd 단순 비율은 DCA 입금액을 알파로 착시하므로,
+    account(load_account) 의 시간가중수익률(TWR) 또는 레코드의 twr 필드를 우선 사용한다.
+    """
+    from ml.adaptive import reward as _reward
+
+    twr_map = _twr_by_date(account)
+    twr_rows: list[tuple[float, float]] = []
+    usd_rows: list[tuple[float, float]] = []
+    for r in records:
+        qqq_v = _pos_finite(r.get("qqq_price"))
+        if qqq_v is None:
+            continue
+        date_key = str(r.get("date") or "")[:10]
+        tv_raw = twr_map.get(date_key) if twr_map else r.get("twr")
+        tv = _pos_finite(tv_raw)
+        if tv is not None:
+            twr_rows.append((tv, qqq_v))
+        usd_v = _pos_finite(r.get("total_usd"))
+        if usd_v is not None:
+            usd_rows.append((usd_v, qqq_v))
+
+    if len(twr_rows) >= MIN_SAMPLES:
+        paired = twr_rows[-window:]
+        basis = "twr"
+    elif len(usd_rows) >= MIN_SAMPLES:
+        paired = usd_rows[-window:]
+        basis = "total_usd_unadjusted"
+    else:
+        return None
+
+    nav = [p[0] for p in paired]
+    idx = [p[1] for p in paired]
     strat_ret = (nav[-1] / nav[0] - 1.0) * 100.0
     qqq_ret = (idx[-1] / idx[0] - 1.0) * 100.0
     strat_mdd = _reward.max_drawdown(nav) * 100.0
     qqq_mdd = _reward.max_drawdown(idx) * 100.0
     excess = strat_ret - qqq_ret
     meets = (excess > 0) and (strat_mdd <= qqq_mdd)      # ★ 아웃퍼폼 + MDD≤지수
-    return {"n": len(rows), "strat_ret": round(strat_ret, 2), "qqq_ret": round(qqq_ret, 2),
+    return {"n": len(paired), "strat_ret": round(strat_ret, 2), "qqq_ret": round(qqq_ret, 2),
             "excess": round(excess, 2), "strat_mdd": round(strat_mdd, 2), "qqq_mdd": round(qqq_mdd, 2),
-            "meets": meets}
+            "meets": meets, "basis": basis}
 
 
 def _conservative_scale(sc: dict) -> float:
@@ -84,23 +144,31 @@ def main() -> int:
         logger.warning("portfolio_history 조회 실패: %s", e)
         return 0
 
-    sc = scorecard(records)
+    account = None
+    try:
+        import portfolio_tracker
+        account = portfolio_tracker.load_account()
+    except Exception as e:
+        logger.warning("계좌 TWR 로드 실패 — total_usd 폴백(shadow 차단): %s", e)
+
+    sc = scorecard(records, account=account)
     if sc is None:
         logger.info("표본 부족 — 평가 보류")
         return 0
 
     enabled = os.getenv("ADAPTIVE_LONGTERM_ENABLED", "false").lower() == "true"
     mark = "✅ 목표 충족" if sc["meets"] else "⚠️ 목표 미달"
+    basis_note = "TWR" if sc.get("basis") == "twr" else "total_usd(입금 미보정 — shadow 차단)"
     lines = [
         "📈 장기 전략 ★목표 스코어카드 (vs QQQ)",
         "━━━━━━━━━━━━━━",
-        f"  최근 {sc['n']}표본",
+        f"  최근 {sc['n']}표본 · 기준 {basis_note}",
         f"  수익  전략 {sc['strat_ret']:+.1f}% vs QQQ {sc['qqq_ret']:+.1f}%  (초과 {sc['excess']:+.1f}%p)",
         f"  MDD   전략 {sc['strat_mdd']:.1f}% vs QQQ {sc['qqq_mdd']:.1f}%",
         f"  {mark} (1순위 아웃퍼폼 + MDD≤지수)",
     ]
-    # 악화 지속 시 보수적 shadow 권고(축소만) — 옵트인 시에만 라이브 의미
-    if not sc["meets"]:
+    # 악화 지속 시 보수적 shadow 권고(축소만) — TWR 기반 + 옵트인 시에만 기록
+    if not sc["meets"] and sc.get("basis") == "twr":
         scale = _conservative_scale(sc)
         if scale < 1.0:
             if enabled:

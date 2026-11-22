@@ -304,7 +304,7 @@ def build_entry_signal(context: dict, model: Optional[LeverageModel] = None) -> 
             p25   = st.p25_ret.get(21, np.nan)
             hr30  = st.hit_rate.get(21, np.nan)
             mdd   = st.max_drawdown
-            rr    = abs(er30 / mdd) if mdd < 0 and np.isfinite(er30) else np.nan
+            rr    = (max(float(er30), 0.0) / abs(float(mdd))) if mdd < 0 and np.isfinite(er30) else np.nan
         else:
             er30 = er90 = p25 = hr30 = np.nan
             mdd  = 0.0

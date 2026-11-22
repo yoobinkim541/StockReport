@@ -258,6 +258,38 @@ def _group_visible_pages(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def paginate_browser_items(
+    items: Iterable[Any],
+    *,
+    page: int = 1,
+    page_size: int = DOCUMENT_BROWSER_PAGE_SIZE,
+) -> dict[str, Any]:
+    """문서 목록을 페이지 단위로 슬라이스한다(범위 밖 page 번호는 [1, total_pages]로 클램프)."""
+    seq = list(items or [])
+    try:
+        size = max(1, int(page_size))
+    except (TypeError, ValueError, OverflowError):
+        size = DOCUMENT_BROWSER_PAGE_SIZE
+    total_items = len(seq)
+    total_pages = max(1, (total_items + size - 1) // size)
+    try:
+        cur_page = int(page)
+    except (TypeError, ValueError, OverflowError):
+        cur_page = 1
+    cur_page = max(1, min(total_pages, cur_page))
+    start = (cur_page - 1) * size
+    end = min(total_items, start + size)
+    return {
+        "items": seq[start:end],
+        "page": cur_page,
+        "page_size": size,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "start": start,
+        "end": end,
+    }
+
+
 def limit_browser_groups(groups: Iterable[dict[str, Any]], *, limit: int = DOCUMENT_BROWSER_PAGE_SIZE) -> list[dict[str, Any]]:
     """문서 브라우저 카드 수만 제한하고 전체 페이지/그래프 모델은 보존한다."""
     remaining = max(0, int(limit or 0))
@@ -1212,23 +1244,48 @@ def render_wiki_tab(surface: str, pack: dict[str, Any] | None = None) -> None:
         groups = browser.get("groups") or []
         visible = browser.get("visible") or []
         if visible:
+            filter_sig = f"{surface_filter}|{status_filter}|{query}"
+            if st.session_state.get("_wiki_browser_filter_sig") != filter_sig:
+                st.session_state["_wiki_browser_filter_sig"] = filter_sig
+                st.session_state["wiki_browser_page"] = 1
+            paged = paginate_browser_items(
+                visible,
+                page=st.session_state.get("wiki_browser_page", 1),
+                page_size=DOCUMENT_BROWSER_PAGE_SIZE,
+            )
+            st.session_state["wiki_browser_page"] = paged["page"]
+            page_items = paged["items"]
+            if paged["total_pages"] > 1:
+                st.caption(
+                    f"{paged['start'] + 1}–{paged['end']} / 전체 {paged['total_items']}개 "
+                    f"(페이지 {paged['page']}/{paged['total_pages']})"
+                )
             if surface_filter == "all" and groups:
-                display_groups = limit_browser_groups(groups, limit=DOCUMENT_BROWSER_PAGE_SIZE)
-                display_count = sum(len(group.get("pages") or []) for group in display_groups)
-                if display_count < len(visible):
-                    st.caption(f"최신 문서 {display_count}개 표시 · 전체 {len(visible)}개")
-                for group in display_groups:
-                    label = f"📁 {group.get('label', group.get('surface', 'wiki'))} · {group.get('count', 0)}"
+                grouped_slice: dict[str, list[dict[str, Any]]] = {}
+                for page in page_items:
+                    surf = str(page.get("surface") or WIKI_SURFACE)
+                    grouped_slice.setdefault(surf, []).append(page)
+                for surf, surf_pages in grouped_slice.items():
+                    label = f"📁 {option_label(SURFACE_LABELS, surf)} · {len(surf_pages)}"
                     with st.expander(label, expanded=True):
-                        for page in group.get("pages") or []:
+                        for page in surf_pages:
                             loaded = _render_tree_item(page, selected_page_id=selected_page_id)
                             if loaded:
                                 load_selected_id = loaded
             else:
-                for page in visible[:DOCUMENT_BROWSER_PAGE_SIZE]:
+                for page in page_items:
                     loaded = _render_tree_item(page, selected_page_id=selected_page_id)
                     if loaded:
                         load_selected_id = loaded
+            if paged["total_pages"] > 1:
+                p_prev, p_info, p_next = st.columns([1, 1.2, 1])
+                if p_prev.button("◀ 이전", key="wiki_page_prev", disabled=paged["page"] <= 1, width="stretch"):
+                    st.session_state["wiki_browser_page"] = paged["page"] - 1
+                    st.rerun()
+                p_info.caption(f"{paged['page']} / {paged['total_pages']}")
+                if p_next.button("다음 ▶", key="wiki_page_next", disabled=paged["page"] >= paged["total_pages"], width="stretch"):
+                    st.session_state["wiki_browser_page"] = paged["page"] + 1
+                    st.rerun()
         else:
             st.info("필터에 맞는 위키가 없습니다.")
 

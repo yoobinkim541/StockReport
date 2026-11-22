@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import time
 
@@ -47,12 +48,22 @@ import requests
 from lib import llm_cli
 
 logger = logging.getLogger(__name__)
+_GEMINI_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 def _openrouter_url():
     return os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 
 def _hive_url():
     return os.getenv("HIVE_URL", "https://api-cdn.thehive.ai/api/v3/chat/completions")
+
+def _gemini_url(model: str) -> str:
+    base = os.getenv("GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta/models").rstrip("/")
+    clean_model = str(model or "gemini-2.5-flash").strip()
+    if clean_model.startswith("models/"):
+        clean_model = clean_model[len("models/"):]
+    if not _GEMINI_MODEL_RE.fullmatch(clean_model) or ".." in clean_model:
+        raise ValueError(f"유효하지 않은 Gemini 모델명: {model!r}")
+    return f"{base}/{clean_model}:generateContent"
 
 AGY_PROVIDER = "agy"
 
@@ -67,6 +78,10 @@ def agy_enabled() -> bool:
 
 def hive_enabled() -> bool:
     return bool(os.getenv("HIVE_API_KEY", "").strip())
+
+
+def gemini_enabled() -> bool:
+    return bool(os.getenv("GEMINI_API_KEY", "").strip())
 
 
 def _arg(cmd: list[str], *names: str) -> str | None:
@@ -128,6 +143,62 @@ def direct_chat(prompt: str, model: str, *, timeout: float | None = None, post=N
 def parse_hive_chat(cmd) -> tuple[str, str] | None:
     """`--provider hive` hermes 명령이면 (prompt, model), 아니면 None."""
     return _parse_chat(cmd, "hive")
+
+
+def parse_gemini_chat(cmd) -> tuple[str, str] | None:
+    """`--provider gemini` hermes 명령이면 (prompt, model), 아니면 None."""
+    return _parse_chat(cmd, "gemini")
+
+
+def gemini_chat(prompt: str, model: str = "gemini-2.5-flash", *, timeout: float | None = None,
+                post=None, max_tokens: int = 8192, structured_output: bool = True) -> str:
+    """Google AI Studio Gemini API 직접 호출(GEMINI_API_KEY, 정식 API ToS 준수).
+
+    API 키는 URL 쿼리스트링이 아니라 `x-goog-api-key` 헤더로만 전달해 로그 유출을 막는다.
+    `structured_output=True` 이면 `responseMimeType=application/json` 을 강제하고
+    `MAX_TOKENS` 절단이나 비유효 JSON 은 `ValueError("structured_response_invalid")` 로 거부한다.
+    """
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY 없음")
+    gen_cfg: dict = {"maxOutputTokens": int(max_tokens)}
+    if structured_output:
+        gen_cfg["responseMimeType"] = "application/json"
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": gen_cfg,
+    }
+    resp = (post or requests.post)(
+        _gemini_url(model),
+        json=body,
+        timeout=timeout or 120,
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(str(data["error"])[:200])
+    candidates = data.get("candidates") if isinstance(data, dict) else None
+    first = (candidates or [{}])[0] if isinstance(candidates, list) else {}
+    content_obj = first.get("content") if isinstance(first, dict) else None
+    parts = (content_obj.get("parts") or []) if isinstance(content_obj, dict) else []
+    if not isinstance(parts, list):
+        parts = []
+    # Gemini 2.5 사고 모델은 thought=True 파트를 별도로 반환하므로 최종 답변 파트만 이어 붙인다.
+    text = "".join(
+        str(p.get("text") or "")
+        for p in parts
+        if isinstance(p, dict) and not p.get("thought")
+    ).strip()
+    if not text:
+        raise RuntimeError("빈 응답")
+    if structured_output:
+        from lib.structured_output import parse_object
+
+        finish_reason = first.get("finishReason") if isinstance(first, dict) else None
+        if (finish_reason and finish_reason != "STOP") or parse_object(text) is None:
+            raise ValueError("structured_response_invalid")
+    return text
 
 
 def hive_chat(prompt: str, model: str, *, timeout: float | None = None, post=None, max_tokens: int = 8192,
@@ -223,6 +294,16 @@ def run(cmd, *args, post=None, fallback=None, agy_runner=None, max_tokens: int |
                              max_tokens=max_tokens or int(os.getenv("LLM_DIRECT_MAX_TOKENS", "4096")))
         except Exception as exc:  # noqa: BLE001 — 실패 시 기존 hermes 경로로
             logger.info("Hive 직접 호출 실패 → hermes로 실행: error=%s elapsed=%.1fs",
+                        type(exc).__name__, time.monotonic() - started)
+            return _fallback_within(deadline, fallback, cmd, args, kwargs)
+        return subprocess.CompletedProcess(cmd, 0, text + "\n", "")
+    gem = parse_gemini_chat(cmd) if gemini_enabled() else None
+    if gem is not None:
+        try:
+            text = gemini_chat(*gem, timeout=timeout, post=post, structured_output=False,
+                               max_tokens=max_tokens or int(os.getenv("LLM_DIRECT_MAX_TOKENS", "4096")))
+        except Exception as exc:  # noqa: BLE001 — 실패 시 기존 hermes 경로로
+            logger.info("Gemini 직접 호출 실패 → hermes로 실행: error=%s elapsed=%.1fs",
                         type(exc).__name__, time.monotonic() - started)
             return _fallback_within(deadline, fallback, cmd, args, kwargs)
         return subprocess.CompletedProcess(cmd, 0, text + "\n", "")

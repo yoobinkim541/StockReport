@@ -172,7 +172,7 @@ def chat_once(prompt: str, *, model: str = "gpt-5-mini", provider: str = "openai
 
 
 DEFAULT_STRUCTURED_PROVIDERS = ("codex", "hermes")
-STRUCTURED_PROVIDERS = frozenset({"codex", "openrouter", "hermes", "agy", "hive"})
+STRUCTURED_PROVIDERS = frozenset({"codex", "openrouter", "hermes", "agy", "hive", "gemini"})
 # Hermes signs in with the same ChatGPT account as Codex: neither answers while that account's window is spent.
 CODEX_ACCOUNT_PROVIDERS = frozenset({"codex", "hermes"})
 _AGY_DEFAULT_MODELS = "gemini-3.8-flash-high,gemini-3.8-flash-medium,gemini-4-argon-low"
@@ -320,9 +320,96 @@ def independent_providers(order: list[str] | None = None) -> list[str]:
     from lib import llm_direct
 
     ready = {"hive": llm_direct.hive_enabled(),
+             "gemini": llm_direct.gemini_enabled(),
              "openrouter": llm_direct.enabled() and bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
              "agy": bool(shutil.which(os.getenv("LLM_BACKUP_CLI", "agy")))}
     return [name for name in (structured_providers() if order is None else order) or [] if ready.get(name)]
+
+
+def _codex_window_busy(usage: dict | None, *, short_pct: int = 70, weekly_pct: int = 90) -> bool:
+    import math
+    if not isinstance(usage, dict) or not usage:
+        return False
+    if not usage.get("allowed", True) or usage.get("reached"):
+        return True
+    for window in usage.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        try:
+            mins = int(window.get("minutes") or 0)
+            used = float(window.get("used_percent") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(used):
+            continue
+        limit = short_pct if mins <= 1440 else weekly_pct
+        if used >= limit:
+            return True
+    return False
+
+
+_CODEX_USAGE_CACHE: tuple[float, dict | None] | None = None
+_CODEX_USAGE_CACHE_TTL = 45.0
+
+
+def _cached_codex_usage(timeout: int = 10) -> dict | None:
+    """실제 운영 배치에서 연속 호출마다 codex app-server 서브프로세스를 반복 기동하지 않도록 짧은 TTL 캐시 적용."""
+    global _CODEX_USAGE_CACHE
+    # 테스트가 codex_usage 를 monkeypatch 한 경우에는 캐시를 우회해 매 호출 모킹 값을 존중한다.
+    is_real = (
+        getattr(codex_usage, "__module__", "") == __name__
+        and getattr(codex_usage, "__name__", "") == "codex_usage"
+    )
+    if not is_real:
+        return codex_usage(timeout=timeout)
+    now = time.monotonic()
+    if _CODEX_USAGE_CACHE is not None and (now - _CODEX_USAGE_CACHE[0]) < _CODEX_USAGE_CACHE_TTL:
+        return _CODEX_USAGE_CACHE[1]
+    usage = codex_usage(timeout=timeout)
+    _CODEX_USAGE_CACHE = (now, usage)
+    return usage
+
+
+def maintenance_structured_chat(prompt: str, *, timeout: int = 90, reasoning: str = "low") -> str | None:
+    """위키 유지보수 배치 공용 단발 구조화 호출 — Codex+Hermes 병렬 레이스 없이 쿼터 가드 적용."""
+    if os.getenv("AGENT_CONSOLE_LLM_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    order = structured_providers()
+    if not order:
+        return None
+    providers_override: str | None = None
+    remaining_timeout = max(5, int(timeout))
+    if any(p in CODEX_ACCOUNT_PROVIDERS for p in order):
+        t0 = time.monotonic()
+        usage = _cached_codex_usage(timeout=min(10, remaining_timeout))
+        elapsed = time.monotonic() - t0
+        remaining_timeout = max(5, int(remaining_timeout - elapsed))
+        if _codex_window_busy(usage):
+            indep = independent_providers(order)
+            if not indep:
+                logger.info("위키 유지보수 호출 건너뜀 — Codex 사용량 임계 초과 및 독립 제공자 없음")
+                return None
+            providers_override = ",".join(indep)
+    text, _ = structured_chat_with_provider(
+        prompt, max_timeout=remaining_timeout, providers=providers_override, reasoning=reasoning,
+    )
+    return text
+
+
+def default_maintenance_llm_fn():
+    """프로덕션에서는 `maintenance_structured_chat` 을 쓰고, 레거시 테스트가 `_try_llm_prompt` 를
+    monkeypatch 한 경우에만 해당 목을 존중한다."""
+    try:
+        from agent_console import agent as _agent
+        fn = getattr(_agent, "_try_llm_prompt", None)
+        if fn is not None and (
+            getattr(fn, "__module__", "") != "agent_console.agent"
+            or getattr(fn, "__name__", "") != "_try_llm_prompt"
+        ):
+            return fn
+    except Exception:
+        pass
+    return maintenance_structured_chat
 
 
 def structured_chat_with_provider(prompt: str, *, max_timeout: int = 180, provider_timeout: int | None = None,
@@ -375,6 +462,13 @@ def structured_chat_with_provider(prompt: str, *, max_timeout: int = 180, provid
                 text = llm_direct.hive_chat(
                     prompt, os.getenv("WIKI_STRUCTURED_HIVE_MODEL", "deepseek-ai/deepseek-v4.1-flash-1017"),
                     timeout=remaining, reasoning=reasoning or "none")
+            elif provider == "gemini":
+                if not llm_direct.gemini_enabled():
+                    outcome = "disabled"
+                    continue
+                text = llm_direct.gemini_chat(
+                    prompt, os.getenv("WIKI_STRUCTURED_GEMINI_MODEL", "gemini-2.5-flash"),
+                    timeout=remaining, structured_output=True, max_tokens=8192)
             elif provider == "openrouter":
                 if not llm_direct.enabled():
                     outcome = "disabled"

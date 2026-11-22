@@ -123,7 +123,9 @@ def build_health_report(dry_run: bool = False) -> dict:
 
 def run_llm_health_review(report: dict) -> list[dict]:
     """LLM에게 위키 상태를 보여주고 구체적인 큐레이션 액션 추천받기"""
-    from agent_console.agent import _try_llm_prompt
+    from lib import llm_cli
+
+    llm_fn = llm_cli.default_maintenance_llm_fn()
 
     pipeline = _pipeline_report(report)
     source_health = pipeline.get("source_health") or {}
@@ -158,8 +160,15 @@ JSON으로 응답해주세요:
 {{"actions": [{{"page_id": "...", "action": "archive|delete|merge|reactivate", "reason": "..."}}], "health_score": 8, "summary": "..."}}"""
 
     try:
-        llm_response = _try_llm_prompt(prompt)
-        return json.loads(llm_response).get("actions", [])
+        llm_response = llm_fn(prompt)
+        if not llm_response:
+            return []
+        from lib.structured_output import parse_object
+        parsed = parse_object(llm_response)
+        if parsed is None:
+            parsed = json.loads(llm_response)
+        actions = parsed.get("actions", []) if isinstance(parsed, dict) else []
+        return [a for a in actions if isinstance(a, dict)] if isinstance(actions, list) else []
     except Exception:
         return []
 

@@ -267,7 +267,8 @@ class BacktestEngine:
         lev_shares  = 0.0
         sgov_px0    = float(sgov.iloc[start_pos])
         sgov_shares = 1.0 / sgov_px0 if np.isfinite(sgov_px0) and sgov_px0 > 0 else 0.0
-        avg_entry   = 0.0       # 가중평균 진입가 (트레일링스탑 기준)
+        avg_entry   = 0.0       # 가중평균 진입가 (수익률 기록용)
+        peak_since_entry = 0.0  # 진입 이후 최고 종가 (진짜 트레일링 스톱 기준)
         entry_date  = None      # 첫 트랜치 진입일
         filled      = 0         # 채워진 트랜치 수
         n_trades    = 0
@@ -282,17 +283,26 @@ class BacktestEngine:
         above_prev   = sig["above_trend"].shift(1).fillna(True)
 
         eval_idx = self.idx[start_pos:]
+        last_valid_pv_inst: float | None = None
+        if start_pos > 0:
+            prev_raw = inst.iloc[start_pos - 1]
+            if not np.isnan(prev_raw):
+                last_valid_pv_inst = float(prev_raw)
         for i, date in enumerate(self.idx[start_pos:], start=start_pos):
-            pv_inst = float(inst.iloc[i]) if not np.isnan(inst.iloc[i]) else (inst.iloc[i-1] if i > 0 else 1.0)
-            pv_sgov = float(sgov.iloc[i]) if not np.isnan(sgov.iloc[i]) else (sgov.iloc[i-1] if i > 0 else 1.0)
+            raw_inst = inst.iloc[i]
+            pv_inst = float(raw_inst) if not np.isnan(raw_inst) else (last_valid_pv_inst if last_valid_pv_inst is not None else 1.0)
+            pv_sgov = float(sgov.iloc[i]) if not np.isnan(sgov.iloc[i]) else (float(sgov.iloc[i - 1]) if i > 0 and not np.isnan(sgov.iloc[i - 1]) else 1.0)
+            prev_pv_inst = last_valid_pv_inst if last_valid_pv_inst is not None else pv_inst
+            exited_today = False
 
-            # ── 청산 체크 (전 트랜치 일괄) ──
+            # ── 청산 체크 (전 트랜치 일괄, 트레일링 스톱은 전일 종가 vs 진입 후 최고점 기준 → 익일 체결) ──
             if lev_shares > 0:
                 ret_from_entry = (pv_inst / avg_entry - 1) if avg_entry > 0 else 0
+                dd_from_peak = (prev_pv_inst / peak_since_entry - 1) if peak_since_entry > 0 else 0
                 hold_days = (date - entry_date).days if entry_date else 0
                 should_exit = (
                     exit_signal.iloc[i] or
-                    ret_from_entry <= t_stop or
+                    dd_from_peak <= t_stop or
                     hold_days >= max_hd
                 )
                 if should_exit:
@@ -300,15 +310,16 @@ class BacktestEngine:
                     lev_shares = 0.0
                     trade_rets.append(ret_from_entry)
                     n_trades += 1
-                    avg_entry, entry_date, filled = 0.0, None, 0
+                    avg_entry, peak_since_entry, entry_date, filled = 0.0, 0.0, None, 0
+                    exited_today = True
 
             # ── 자금곡선 스톱: 전략 자체 낙폭이 한도 초과면 신규 진입 차단 ──
             eq_blocked = False
             if eq_limit and port_values:
                 eq_blocked = (port_values[-1] / eq_peak - 1) <= -float(eq_limit)
 
-            # ── 진입 체크 (트랜치 k: 낙폭이 min_dd - k×step 도달 시 추가 진입) ──
-            if (not eq_blocked and filled < n_tr and enter_signal.iloc[i]):
+            # ── 진입 체크 (당일 청산 직후 같은 봉 재진입 금지, 트랜치 k: 낙폭이 min_dd - k×step 도달 시 추가 진입) ──
+            if (not exited_today and not eq_blocked and filled < n_tr and enter_signal.iloc[i]):
                 dd_y = float(dd_prev.iloc[i]) if np.isfinite(dd_prev.iloc[i]) else 0.0
                 if dd_y <= self.p["min_dd"] - filled * tr_step:
                     total = cash + lev_shares * pv_inst + sgov_shares * pv_sgov
@@ -340,7 +351,16 @@ class BacktestEngine:
                         cash      -= invest
                         if entry_date is None:
                             entry_date = date
+                            peak_since_entry = pv_inst
+                        else:
+                            peak_since_entry = max(peak_since_entry, pv_inst)
                         filled += 1
+
+            # 보유 중이면 당일 종가로 진입 후 최고점 갱신 (다음 봉 트레일링 스톱 판단에 사용)
+            if lev_shares > 0:
+                peak_since_entry = max(peak_since_entry, pv_inst)
+            if not np.isnan(raw_inst):
+                last_valid_pv_inst = float(raw_inst)
 
             # ── SGOV 리밸런싱 (현금 → SGOV) ──
             sgov_val = sgov_shares * pv_sgov
@@ -654,10 +674,46 @@ def optimize_leverage(
     best_inst = max(per_instrument, key=_select_key)
     best      = per_instrument[best_inst]
 
-    save_result(best, per_instrument=per_instrument)
-    logger.info("최적화 완료 — 최우수 종목: %s (WF median Calmar %.2f, 전체 Calmar %.2f)",
-                best_inst, best.wf_median_calmar, best.best_calmar)
+    adopted, reason = save_result_if_better(best, per_instrument=per_instrument)
+    logger.info("최적화 완료 — 최우수 종목: %s (WF median Calmar %.2f, 전체 Calmar %.2f, 채택=%s: %s)",
+                best_inst, best.wf_median_calmar, best.best_calmar, adopted, reason)
     return best
+
+
+def _finite_float(val) -> Optional[float]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        fv = float(val)
+    except (TypeError, ValueError):
+        return None
+    return fv if np.isfinite(fv) else None
+
+
+def save_result_if_better(
+    r: OptimizationResult,
+    per_instrument: dict[str, OptimizationResult] | None = None,
+) -> tuple[bool, str]:
+    """OOS WF median Calmar 챔피언-챌린저 게이트 — 기존 챔피언보다 나빠지면 덮어쓰지 않는다."""
+    cand_calmar = _finite_float(r.wf_median_calmar)
+    if cand_calmar is None:
+        return False, "wf_median_calmar_nonfinite"
+    cand_folds = len(r.wf_results or [])
+    prev = load_result()
+    if isinstance(prev, dict):
+        prev_folds = int(_finite_float(prev.get("n_wf_folds")) or 0)
+        if cand_folds == 0 and prev_folds > 0:
+            logger.info("레버리지 파라미터 갱신 보류: 후보 WF fold 0개 < 기존 검증 챔피언(%d folds)", prev_folds)
+            return False, f"no_wf_folds (0 < {prev_folds})"
+        prev_calmar = _finite_float(prev.get("wf_median_calmar"))
+        if prev_calmar is not None and cand_calmar < prev_calmar:
+            logger.info(
+                "레버리지 파라미터 갱신 보류: 후보 WF median Calmar %.3f < 기존 %.3f",
+                cand_calmar, prev_calmar,
+            )
+            return False, f"oos_regression ({cand_calmar:.3f} < {prev_calmar:.3f})"
+    save_result(r, per_instrument=per_instrument)
+    return True, "adopted"
 
 
 # ── 저장 / 로드 ───────────────────────────────────────────────────────────────
@@ -683,6 +739,8 @@ def save_result(
     r: OptimizationResult,
     per_instrument: dict[str, OptimizationResult] | None = None,
 ) -> None:
+    import os
+    import tempfile
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     data = _result_to_dict(r)
     # 종목별 결과도 함께 저장
@@ -691,7 +749,16 @@ def save_result(
             inst: _result_to_dict(res)
             for inst, res in per_instrument.items()
         }
-    RESULTS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    fd, tmp = tempfile.mkstemp(prefix=f".{RESULTS_PATH.name}.", dir=RESULTS_PATH.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, RESULTS_PATH)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     logger.info("최적화 결과 저장: %s", RESULTS_PATH)
 
 

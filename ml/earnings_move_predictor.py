@@ -49,14 +49,46 @@ def _price_feats(closes, event_date):
     return window_feats(closes, event_date)
 
 
+def lookup_pit_snapshot(
+    snapshots: list[dict],
+    ticker: str,
+    event_date: str,
+    field: str,
+    *,
+    max_age_days: int = 45,
+) -> float | None:
+    """event_date 이전(<) 가장 최근 스냅샷의 field 값 (ml.earnings_predictor 공용 구현 위임)."""
+    from ml.earnings_predictor import lookup_pit_snapshot as _lookup
+    return _lookup(snapshots, ticker, event_date, field, max_age_days=max_age_days)
+
+
+OPT_SNAP_PATH = Path(os.path.expanduser("~/reports/ml-cache/options_snapshots.jsonl"))
+
+
+def _lookup_opt_expected_move(
+    snapshots: list[dict],
+    ticker: str,
+    event_date: str,
+    *,
+    max_age_days: int = 45,
+) -> float | None:
+    """options_snapshots.jsonl 표준 키(`expected_move_pct`) 우선, 구형(`iv_expected_move`) 폴백."""
+    val = lookup_pit_snapshot(snapshots, ticker, event_date, "expected_move_pct", max_age_days=max_age_days)
+    if val is not None:
+        return val
+    return lookup_pit_snapshot(snapshots, ticker, event_date, "iv_expected_move", max_age_days=max_age_days)
+
+
 def build_training_set(tickers: list[str], *, min_prior: int = 3):
-    """earnings_reaction 과거 반응 → (rows, mag_labels, dir_labels, meta). 시간순.
+    """earnings_reaction 과거 반응 + PIT 옵션 스냅샷 → (rows, mag_labels, dir_labels, meta). 시간순.
 
     mag_label=|reaction_1d|, dir_label=1 if reaction_1d>0.
     """
     from reports import earnings_reaction as er
     from lib.price_utils import fetch_closes
+    from ml.earnings_predictor import _load_pit_snapshots
 
+    opt_snaps = _load_pit_snapshots(OPT_SNAP_PATH)
     rows, mag, dirn, meta = [], [], [], []
     for tk in tickers:
         closes = fetch_closes(tk)
@@ -73,7 +105,9 @@ def build_training_set(tickers: list[str], *, min_prior: int = 3):
                                 and (p["surprise_pct"] > 0) == (p["drift_5d"] > 0)) else 0
                           for p in prior if p.get("surprise_pct") is not None and p.get("drift_5d") is not None]
             mom, vol = _price_feats(closes, ev["date"])
-            rows.append({"features": event_features(abs_moves, drift_hits, surprises, mom, vol)})
+            iv_move = _lookup_opt_expected_move(opt_snaps, tk, ev["date"])
+            rows.append({"features": event_features(abs_moves, drift_hits, surprises, mom, vol,
+                                                    iv_expected_move=iv_move)})
             mag.append(abs(ev["reaction_1d"]))
             dirn.append(1 if ev["reaction_1d"] > 0 else 0)
             meta.append({"ticker": tk, "date": ev["date"]})
@@ -101,23 +135,35 @@ def train(rows: list[dict], mag_labels: list[float], dir_labels: list[int], *, t
     X = np.array(_matrix(rows), float)
     ym, yd = np.array(mag_labels, float), np.array(dir_labels, int)
     s = int(n * time_split)
-    # 변동폭 회귀
-    reg = LGBMRegressor(n_estimators=150, learning_rate=0.05, num_leaves=15, min_child_samples=15, verbose=-1)
-    reg.fit(X[:s], ym[:s])
-    mae = float(mean_absolute_error(ym[s:], reg.predict(X[s:])))
+    # 변동폭 회귀 (OOS 평가 후 전구간 재적합)
+    reg_oos = LGBMRegressor(n_estimators=150, learning_rate=0.05, num_leaves=15,
+                            min_child_samples=15, subsample=0.8, subsample_freq=1,
+                            random_state=42, verbose=-1)
+    reg_oos.fit(X[:s], ym[:s])
+    mae = float(mean_absolute_error(ym[s:], reg_oos.predict(X[s:])))
     naive = float(mean_absolute_error(ym[s:], np.full(len(ym[s:]), ym[:s].mean())))   # 평균예측 베이스라인
-    # 방향 분류(약한 신호 — 정직)
+    reg = LGBMRegressor(n_estimators=150, learning_rate=0.05, num_leaves=15,
+                        min_child_samples=15, subsample=0.8, subsample_freq=1,
+                        random_state=42, verbose=-1)
+    reg.fit(X, ym)
+    # 방향 분류(약한 신호 — 정직; OOS 평가 후 전구간 재적합)
     dir_auc = None
     dir_model = None
-    if yd[:s].sum() >= 8 and yd[s:].sum() >= 3 and len(set(yd[s:].tolist())) >= 2:
-        clf = LGBMClassifier(n_estimators=120, learning_rate=0.05, num_leaves=15, min_child_samples=15, verbose=-1)
-        clf.fit(X[:s], yd[:s])
-        dir_auc = round(float(roc_auc_score(yd[s:], clf.predict_proba(X[s:])[:, 1])), 3)
-        dir_model = clf
+    if (yd[:s].sum() >= 8 and yd[s:].sum() >= 3
+            and len(set(yd[:s].tolist())) >= 2 and len(set(yd[s:].tolist())) >= 2):
+        clf_oos = LGBMClassifier(n_estimators=120, learning_rate=0.05, num_leaves=15,
+                                 min_child_samples=15, subsample=0.8, subsample_freq=1,
+                                 random_state=42, verbose=-1)
+        clf_oos.fit(X[:s], yd[:s])
+        dir_auc = round(float(roc_auc_score(yd[s:], clf_oos.predict_proba(X[s:])[:, 1])), 3)
+        dir_model = LGBMClassifier(n_estimators=120, learning_rate=0.05, num_leaves=15,
+                                   min_child_samples=15, subsample=0.8, subsample_freq=1,
+                                   random_state=42, verbose=-1)
+        dir_model.fit(X, yd)
     return {"mag_model": reg, "dir_model": dir_model, "n": n,
             "mag_mae": round(mae, 4), "mag_mae_naive": round(naive, 4),
             "mag_skill": round(1 - mae / naive, 3) if naive > 0 else None,
-            "dir_auc": dir_auc,
+            "dir_auc": dir_auc, "fit_scope": "all_labeled",
             "reason": (f"학습 완료 — 변동폭 MAE {mae:.3f} vs 나이브 {naive:.3f}"
                        f"(skill {round(1-mae/naive,3) if naive>0 else 'na'}), 방향 AUC {dir_auc}")}
 
@@ -162,11 +208,20 @@ def load_model(path: Path = MODEL_PATH):
     return None
 
 
-def features_now(ticker: str, *, today: str | None = None, beat_prob=None) -> dict:
-    """다음 실적 직전 피처 1행 — 과거 반응 통계 + 최근 모멘텀/변동성 + (G3)beat확률."""
+def features_now(
+    ticker: str,
+    *,
+    today: str | None = None,
+    beat_prob=None,
+    iv_expected_move: float | None = None,
+) -> dict:
+    """다음 실적 직전 피처 1행 — 과거 반응 통계 + 최근 모멘텀/변동성 + beat확률 + PIT 옵션 기대변동폭."""
     import datetime as _dt
     from reports import earnings_reaction as er
     from lib.price_utils import fetch_closes, window_feats
+    from ml.earnings_predictor import _load_pit_snapshots
+
+    today_str = today or _dt.date.today().isoformat()
     closes = fetch_closes(ticker)
     reactions = er.post_earnings_reactions(ticker, prices=closes) if closes is not None else []
     reactions = [r for r in reactions if r.get("reaction_1d") is not None]
@@ -177,8 +232,17 @@ def features_now(ticker: str, *, today: str | None = None, beat_prob=None) -> di
                   for r in reactions if r.get("surprise_pct") is not None and r.get("drift_5d") is not None]
     mom = vol = None
     if closes is not None:
-        mom, vol = window_feats(closes, today or _dt.date.today().isoformat())
-    return {"features": event_features(abs_moves, drift_hits, surprises, mom, vol, beat_prob=beat_prob)}
+        mom, vol = window_feats(closes, today_str)
+    if iv_expected_move is None:
+        # train/serve 정합성 유지: 로컬 PIT 옵션 스냅샷에서 당일 이전(또는 +1일 기준 최근) 값을 조회
+        try:
+            ref_d = (_dt.date.fromisoformat(str(today_str)[:10]) + _dt.timedelta(days=1)).isoformat()
+            opt_snaps = _load_pit_snapshots(OPT_SNAP_PATH)
+            iv_expected_move = _lookup_opt_expected_move(opt_snaps, ticker, ref_d)
+        except Exception:
+            iv_expected_move = None
+    return {"features": event_features(abs_moves, drift_hits, surprises, mom, vol,
+                                       beat_prob=beat_prob, iv_expected_move=iv_expected_move)}
 
 
 def predict_for_ticker(ticker: str, res=None, *, today: str | None = None, beat_prob=None):

@@ -102,9 +102,12 @@ def build_samples(days: int = 1260) -> pd.DataFrame:
             win_20 = float(np.average(rets > 0, weights=w))
             exp_20 = _weighted_quantile(rets, w, 0.5)
             p25_20 = _weighted_quantile(rets, w, 0.25)
-            dd_v   = float(own_dd.iloc[i]) if np.isfinite(own_dd.iloc[i]) else 0.0
+            # 라이브 entry_analyzer.py 와 동일하게 signal_price(레버리지는 기초자산) 낙폭 사용
+            raw_dd = cur.get("drawdown", own_dd.iloc[i])
+            dd_v   = float(raw_dd) if np.isfinite(raw_dd) else 0.0
+            label_end = feat.index[i + 20] if (i + 20) < len(feat.index) else (t + pd.offsets.BDay(20))
             rows.append({
-                "ticker": ticker, "date": t, "category": category,
+                "ticker": ticker, "date": t, "label_end": label_end, "category": category,
                 "win_20": win_20, "exp_20": exp_20, "p25_20": p25_20,
                 "rsi": float(cur["rsi"]), "dd": dd_v,
                 "div": float(cur.get("divergence", 0.0)), "fwd_20": float(fwd),
@@ -159,17 +162,39 @@ def grid_search(cal: pd.DataFrame) -> tuple[dict, dict]:
     return best_params, best_metrics
 
 
+def purged_cal_val_split(
+    samples: pd.DataFrame,
+    frac: float = 0.6,
+    embargo_days: int = 20,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """20거래일 선행수익 라벨 겹침을 제거한 purged 캘리브레이션/검증 분할.
+
+    label_end 컬럼이 있으면 cal 마지막 라벨 종점(cal['label_end'].max()) 이후로 val 을 시작하고,
+    없으면 휴장일 버퍼를 포함한 영업일 오프셋(BDay(embargo_days + 3))으로 20거래일 초과 간격을 보장한다.
+    """
+    ordered = samples.sort_values("date").reset_index(drop=True)
+    split = ordered["date"].quantile(frac)
+    cal = ordered[ordered["date"] <= split]
+    if not cal.empty and "label_end" in cal.columns and cal["label_end"].notna().any():
+        val_start = cal["label_end"].max()
+    else:
+        val_start = split + pd.offsets.BDay(int(embargo_days) + 3)
+    val = ordered[ordered["date"] > val_start]
+    return cal, val
+
+
 def main() -> int:
     logger.info("=== entry score 캘리브레이션 시작 ===")
     samples = build_samples()
     if samples.empty:
         logger.error("샘플 없음")
         return 1
-    samples = samples.sort_values("date").reset_index(drop=True)
-    split   = samples["date"].quantile(0.6)
-    cal, val = samples[samples["date"] <= split], samples[samples["date"] > split]
-    logger.info("샘플 %d건 (캘리브레이션 %d / 검증 %d, 분할일 %s)",
-                len(samples), len(cal), len(val), split.date())
+    cal, val = purged_cal_val_split(samples, frac=0.6, embargo_days=20)
+    if cal.empty or val.empty:
+        logger.error("purged 분할 후 표본 부족 (cal=%d / val=%d)", len(cal), len(val))
+        return 1
+    logger.info("샘플 %d건 (캘리브레이션 %d / 검증 %d, purge=20일, cal_end=%s / val_start=%s)",
+                len(samples), len(cal), len(val), cal["date"].max().date(), val["date"].min().date())
 
     base_val = evaluate(val, DEFAULT_SCORE_PARAMS)
     logger.info("[기본값 OOS] n=%d  평균20d수익=%+.2f%%  승률=%.0f%%",

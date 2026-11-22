@@ -218,7 +218,7 @@ def _apply_with_witness_v3(batch, witness):
     for row in commit["snapshots"]:
         wiki._snapshot_page_revision(row)
     result = shared_memory.guarded_batch_upsert(upserts=commit["upserts"], expected=commit["expected_before"],
-        fingerprint=fingerprint, preserve_fields=("useCount", "lastUsedAt", "lastQuery"))
+        fingerprint=fingerprint, preserve_fields=("useCount", "lastUsedAt", "lastQuery", "feedback"))
     wiki._CACHE.clear()
     return result
 

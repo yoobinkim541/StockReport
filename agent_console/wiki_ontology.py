@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
 import unicodedata
 from collections import Counter, defaultdict
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
@@ -61,9 +63,17 @@ RELATION_TYPES: dict[str, tuple[str, bool]] = {
     "exposed_to": ("노출", False),          # 기업·산업·자산 → 테마·이벤트·지표
     "conflicts_with": ("갈등·대립", True),
 }
-RELATION_STATES = {"asserted": "단일 발행자", "corroborated": "복수 발행자 일치", "contested": "엇갈림"}
+RELATION_STATES = {
+    "asserted": "단일 발행자",
+    "corroborated": "복수 발행자 일치",
+    "contested": "엇갈림",
+    "superseded": "시점 대체",
+}
 RELATION_MODALITIES = {"reported": "보도·서술", "view": "견해·전망"}
 _OPPOSITE = {"positive_for": "negative_for", "negative_for": "positive_for"}
+SUPERSESSION_DAYS = 30
+RECENCY_HALF_LIFE_DAYS = 30.0
+CONTEXT_TWO_HOP_MAX = 2
 # 검토자가 고를 수 있는 판정과 사유. reject 는 _REJECT_REASONS 중 하나가 있어야 반영된다.
 REVIEW_VERDICTS = ("keep", "view", "reject")
 REVIEW_REASONS: dict[str, str] = {
@@ -646,23 +656,53 @@ def compile_ontology(pages: Iterable[dict], extractions: dict | None = None, *, 
                 if tuple(pair) in claim_index and pair not in row["counter"] and pair not in row["evidence"]:
                     row["counter"].append(pair)
 
+    # 각 관계의 최신 관측일(last_seen) 선계산 — 상반 관계가 SUPERSESSION_DAYS 초과 간격이면 시점 대체 처리
+    relation_last_day: dict[tuple[str, str, str], date | None] = {}
+    for key, row in merged.items():
+        days = [_parse_day(claim_index[(pid, cid)]["day"]) for pid, cid in row["evidence"]]
+        valid_days = [d for d in days if d is not None]
+        relation_last_day[key] = max(valid_days) if valid_days else None
+
     relations = []
     for (relation_type, source, target), row in merged.items():
         facts = [claim_index[(page_id, claim_id)] for page_id, claim_id in row["evidence"]]
         revisions = {fact["revision"] for fact in facts}
         voices = sorted({fact["publisher"] for fact in facts})
         opposite = _OPPOSITE.get(relation_type)
-        contested = (any(fact["competing"] for fact in facts) or bool(row["counter"])
-                     or bool(opposite and (opposite, source, target) in merged))
+        opp_key = (opposite, source, target) if opposite else None
+        has_opposite = bool(opp_key and opp_key in merged)
+        superseded_by = ""
+        supersedes = ""
+        opposite_contested = has_opposite
+        if has_opposite and opp_key is not None:
+            my_day = relation_last_day.get((relation_type, source, target))
+            opp_day = relation_last_day.get(opp_key)
+            if my_day is not None and opp_day is not None and abs((my_day - opp_day).days) > SUPERSESSION_DAYS:
+                opposite_contested = False
+                if my_day > opp_day:
+                    supersedes = relation_id(opposite, source, target)
+                else:
+                    superseded_by = relation_id(opposite, source, target)
+        contested = any(fact["competing"] for fact in facts) or bool(row["counter"]) or opposite_contested
+        if superseded_by and not contested:
+            state = "superseded"
+        elif contested:
+            state = "contested"
+        elif len(voices) >= 2:
+            state = "corroborated"
+        else:
+            state = "asserted"
         relations.append({
             "id": relation_id(relation_type, source, target), "type": relation_type, "from": source, "to": target,
             "evidence": row["evidence"][:MAX_EVIDENCE_PER_RELATION], "source_count": len(revisions),
             "publisher_count": len(voices), "publishers": voices,
             "perspectives": sorted({fact["role"] for fact in facts}),
-            "state": "contested" if contested else "corroborated" if len(voices) >= 2 else "asserted",
+            "state": state,
             "modality": "reported" if row["reported"] else "view",
             "review": {**dict(row["verdicts"]), **({"reasons": row["reasons"][:4]} if row["reasons"] else {})},
             **({"counter": row["counter"][:8]} if row["counter"] else {}),
+            **({"superseded_by": superseded_by} if superseded_by else {}),
+            **({"supersedes": supersedes} if supersedes else {}),
             "last_seen": max((fact["day"] for fact in facts), default=""), "notes": row["notes"][:3],
         })
     relations.sort(key=lambda item: (-item["source_count"], item["type"], item["from"], item["to"]))
@@ -827,28 +867,190 @@ CONTEXT_RELATIONS = 4
 CONTEXT_SINGLE_SOURCE_RELATIONS = 2
 
 
+def _parse_day(value: object) -> date | None:
+    text = str(value or "").strip()[:10]
+    if len(text) != 10:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _recency_decay(last_seen: object, ref_day: date | None, *, half_life: float = RECENCY_HALF_LIFE_DAYS) -> float:
+    """오래될수록 지수 감쇠(half_life일당 0.5). 기준일이 있을 때 날짜 미상 관계는 1반감기(0.5)로 보수 처리한다."""
+    if ref_day is None:
+        return 1.0
+    seen = _parse_day(last_seen)
+    if seen is None:
+        return 0.5
+    age_days = max(0, (ref_day - seen).days)
+    return math.pow(0.5, age_days / max(1.0, float(half_life)))
+
+
+def _is_superseded(relation: dict) -> bool:
+    return relation.get("state") == "superseded" or bool(relation.get("superseded_by"))
+
+
+def _ontology_ref_day(ontology: dict, as_of: object = None) -> date | None:
+    explicit = _parse_day(as_of)
+    if explicit is not None:
+        return explicit
+    gen = _parse_day(ontology.get("generated_at"))
+    if gen is not None:
+        return gen
+    days = [_parse_day(r.get("last_seen")) for r in ontology.get("relations") or []]
+    valid = [d for d in days if d is not None]
+    return max(valid) if valid else None
+
+
 def _single_source(relation: dict) -> bool:
     return (relation.get("publisher_count") or 0) <= 1 and (relation.get("source_count") or 0) <= 1
 
 
-def context_relations(ontology: dict, entity_id: str) -> tuple[list[dict], int]:
-    """프롬프트에 넣을 관계와 빠진 출처 1개 관계 수. 복수 발행자 일치 → 발행자 수 → 출처 수 → 보도(견해는 뒤) 순."""
-    ranked = sorted(entity_relations(ontology, entity_id), key=lambda relation: (
-        relation.get("state") != "corroborated", -(relation.get("publisher_count") or 0),
-        -(relation.get("source_count") or 0), relation.get("modality") == "view"))
-    backed = [relation for relation in ranked if not _single_source(relation)][:CONTEXT_RELATIONS]
-    single = [relation for relation in ranked if _single_source(relation)]
+def _relation_rank_score(relation: dict, ref_day: date | None) -> tuple:
+    """관계 우선순위: 활성(비대체) → 복수발행자(corroborated) → 감쇠 발행자·출처 점수 → 보도 우선."""
+    decay = _recency_decay(relation.get("last_seen"), ref_day)
+    pub_score = float(relation.get("publisher_count") or 0) * decay
+    src_score = float(relation.get("source_count") or 0) * decay
+    return (
+        _is_superseded(relation),
+        relation.get("state") != "corroborated",
+        -round(pub_score, 6),
+        -round(src_score, 6),
+        relation.get("modality") == "view",
+    )
+
+
+def context_relations(ontology: dict, entity_id: str, *, as_of: object = None) -> tuple[list[dict], int]:
+    """프롬프트에 넣을 관계와 빠진 출처 1개 관계 수. 시간 감쇠(반감기 30일) 적용."""
+    ref_day = _ontology_ref_day(ontology, as_of=as_of)
+    ranked = sorted(entity_relations(ontology, entity_id), key=lambda r: _relation_rank_score(r, ref_day))
+    active = [r for r in ranked if not _is_superseded(r)]
+    pool = active if active else ranked
+    backed = [relation for relation in pool if not _single_source(relation)][:CONTEXT_RELATIONS]
+    single = [relation for relation in pool if _single_source(relation)]
     shown = single[:min(CONTEXT_SINGLE_SOURCE_RELATIONS, CONTEXT_RELATIONS - len(backed))]
     return backed + shown, len(single) - len(shown)
 
 
+_ALLOWED_TWO_HOP_DIRS = frozenset({
+    ("out", "out"),
+    ("out", "sym"),
+    ("sym", "out"),
+    ("sym", "sym"),
+    ("in", "in"),
+    ("in", "sym"),
+    ("sym", "in"),
+})
+
+
+def two_hop_chains(
+    ontology: dict,
+    entity_id: str,
+    *,
+    exclude_targets: set[str] | None = None,
+    max_chains: int = CONTEXT_TWO_HOP_MAX,
+    as_of: object = None,
+) -> list[tuple[dict, dict, str, str]]:
+    """복수 발행자 일치(corroborated) 엣지만 방향 일관성 있게 따라가는 2-hop 연쇄 경로 [(r1, r2, mid_id, dest_id)].
+
+    하류(A → M → D)와 상류(D → M → A), 대칭(↔) 조합만 허용하며, 충돌기(A → M ← D)와
+    공통원인 분기(A ← M → D)는 인과 연쇄로 착각하지 않도록 제외한다.
+    """
+    if max_chains <= 0:
+        return []
+    ref_day = _ontology_ref_day(ontology, as_of=as_of)
+    corroborated = [
+        r for r in ontology.get("relations") or []
+        if r.get("state") == "corroborated" and not _is_superseded(r)
+    ]
+    if not corroborated:
+        return []
+    adj: dict[str, list[tuple[dict, str, str]]] = defaultdict(list)
+    for rel in corroborated:
+        src, dst = str(rel.get("from") or ""), str(rel.get("to") or "")
+        if not src or not dst or src == dst:
+            continue
+        _label, symmetric = RELATION_TYPES.get(rel.get("type", ""), (str(rel.get("type") or ""), False))
+        if symmetric:
+            adj[src].append((rel, dst, "sym"))
+            adj[dst].append((rel, src, "sym"))
+        else:
+            adj[src].append((rel, dst, "out"))
+            adj[dst].append((rel, src, "in"))
+
+    blocked = {entity_id, *(exclude_targets or ())}
+    direct_neighbors = {nbr for _rel, nbr, _d in adj.get(entity_id, ())}
+    candidates: list[tuple[tuple[float, float, float], tuple[str, str, str, str], tuple[dict, dict, str, str]]] = []
+    for r1, mid, d1 in adj.get(entity_id, ()):
+        if mid == entity_id:
+            continue
+        w1 = float(r1.get("publisher_count") or 1) * _recency_decay(r1.get("last_seen"), ref_day)
+        r1_id = str(r1.get("id") or "")
+        for r2, dest, d2 in adj.get(mid, ()):
+            if (d1, d2) not in _ALLOWED_TWO_HOP_DIRS:
+                continue
+            if dest in blocked or dest == mid or dest in direct_neighbors:
+                continue
+            r2_id = str(r2.get("id") or "")
+            if r1_id and r1_id == r2_id:
+                continue
+            w2 = float(r2.get("publisher_count") or 1) * _recency_decay(r2.get("last_seen"), ref_day)
+            geo = math.sqrt(max(0.0, w1 * w2))
+            bottleneck = min(w1, w2)
+            score = (round(geo, 6), round(bottleneck, 6), round(w1 + w2, 6))
+            candidates.append((score, (dest, mid, r1_id, r2_id), (r1, r2, mid, dest)))
+
+    # 모든 후보 경로를 먼저 점수 내림차순으로 정렬한 뒤 dest 중복을 제거해
+    # 오래된 경로가 최신·고신뢰 경로를 가리는 현상을 막는다.
+    candidates.sort(key=lambda item: (-item[0][0], -item[0][1], -item[0][2], item[1]))
+    seen_dest: set[str] = set()
+    out: list[tuple[dict, dict, str, str]] = []
+    for _score, _tie, chain in candidates:
+        dest = chain[3]
+        if dest in seen_dest:
+            continue
+        seen_dest.add(dest)
+        out.append(chain)
+        if len(out) >= max_chains:
+            break
+    return out
+
+
+def _format_two_hop_chain(ontology: dict, entity_id: str, r1: dict, r2: dict, mid: str, dest: str) -> str:
+    """2-hop 연쇄를 실제 방향(from → to / ↔) 그대로 표기해 인과 역전을 막는다."""
+    l1, sym1 = RELATION_TYPES.get(r1.get("type", ""), (str(r1.get("type") or ""), False))
+    l2, sym2 = RELATION_TYPES.get(r2.get("type", ""), (str(r2.get("type") or ""), False))
+    a1 = "↔" if sym1 else "→"
+    a2 = "↔" if sym2 else "→"
+    is_upstream = (not sym1 and r1.get("to") == entity_id) or (sym1 and not sym2 and r2.get("to") == mid)
+    if is_upstream:
+        return (
+            f"{_entity_display(ontology, dest)} {a2} {_entity_display(ontology, mid)} [{l2}] "
+            f"{a1} {_entity_display(ontology, entity_id)} [{l1}]"
+        )
+    return (
+        f"{_entity_display(ontology, entity_id)} {a1} {_entity_display(ontology, mid)} [{l1}] "
+        f"{a2} {_entity_display(ontology, dest)} [{l2}]"
+    )
+
+
+def _entity_display(ontology: dict, entity_id: str) -> str:
+    ent = (ontology.get("entities") or {}).get(entity_id)
+    if isinstance(ent, dict) and ent.get("name"):
+        return str(ent["name"])
+    return entity_id.split(":", 1)[-1]
+
+
 def context_section(query: object, *, insights: Iterable[dict] = (), limit: int = 3, root: Path | None = None) -> str:
-    """LLM 프롬프트에 넣을 온톨로지 블록. 질문에 나온 개체의 관계와 연결된 인사이트만."""
+    """LLM 프롬프트에 넣을 온톨로지 블록. 질문에 나온 개체의 1-hop 관계 + corroborated 2-hop 연쇄 + 인사이트."""
     entities = find_entities(query, limit=limit, root=root)
     if not entities:
         return ""
     ontology = load_ontology(root) or {}
     by_entity = {insight_entity_id(page).casefold(): page for page in insights or [] if page.get("status") != "archived"}
+    matched_ids = {str(e.get("id") or "") for e in entities}
     lines = ["[위키 온톨로지]"]
     single_shown = False
     for entity in entities:
@@ -858,6 +1060,10 @@ def context_section(query: object, *, insights: Iterable[dict] = (), limit: int 
         for relation in relations:
             single_shown = single_shown or _single_source(relation)
             lines.append(f"  · {relation_phrase(ontology, relation)} — {relation_label(relation)}")
+        for r1, r2, mid, dest in two_hop_chains(ontology, entity["id"], exclude_targets=matched_ids):
+            lines.append(
+                f"  · 연쇄(2-hop, 복수 발행자): {_format_two_hop_chain(ontology, entity['id'], r1, r2, mid, dest)}"
+            )
         if omitted:
             lines.append(f"  · 출처 1개 관계 {omitted}건 생략")
         insight = by_entity.get(entity["id"].casefold())
@@ -922,7 +1128,7 @@ def render_markdown(ontology: dict) -> str:
         for relation in relations[:400]:
             note = f" — {relation['notes'][0]}" if relation.get("notes") else ""
             lines.append(f"- {relation_phrase(ontology, relation)} · {relation_label(relation)}"
-                         f" · 근거 claim {len(relation['evidence'])}건{note}")
+                         f" · 근거 claim {len(relation.get('evidence') or [])}건{note}")
         lines.append("")
     rejected = ontology.get("rejected") or []
     if rejected:

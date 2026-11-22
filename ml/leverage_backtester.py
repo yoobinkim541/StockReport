@@ -42,6 +42,16 @@ DRAWDOWN_BUCKETS = [
 ]
 
 
+def select_drawdown_bucket(cur_dd: float) -> tuple[float, float]:
+    """현재 낙폭에 대응하는 버킷 선택 — -50% 초과 극단 크래시는 정상 구간이 아니라 최심 낙폭 구간으로 매핑."""
+    for lo, hi in DRAWDOWN_BUCKETS:
+        if lo <= cur_dd < hi:
+            return (lo, hi)
+    if cur_dd < DRAWDOWN_BUCKETS[-1][0]:
+        return (min(-1.0, float(cur_dd)), DRAWDOWN_BUCKETS[-1][1])
+    return (-0.05, 0.0)
+
+
 # ── 데이터 로드 ───────────────────────────────────────────────────────────────
 
 def _fetch(tickers: list[str], days: int = 2520) -> dict[str, pd.Series]:
@@ -414,10 +424,7 @@ def get_current_entry_context(days: int = 2520) -> dict:
     }
 
     # 현재 낙폭 구간 통계
-    bucket = next(
-        ((lo, hi) for lo, hi in DRAWDOWN_BUCKETS if lo <= cur_dd < hi),
-        (-0.05, 0.0),
-    )
+    bucket = select_drawdown_bucket(cur_dd)
     stats = compute_entry_stats(events, drawdown_range=bucket)
 
     # 유사 조건 이벤트 수 (낙폭 ±5%, VIX ±5 범위)

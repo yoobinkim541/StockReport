@@ -135,9 +135,9 @@ def run(
     limit: int | None = None,
 ) -> dict:
     if llm_fn is None:
-        from agent_console.agent import _try_llm_prompt
+        from lib import llm_cli
 
-        llm_fn = _try_llm_prompt
+        llm_fn = llm_cli.default_maintenance_llm_fn()
     batch_size = _batch_size() if limit is None else max(1, min(50, int(limit)))
     candidates = select_backfill_candidates(wiki._all_wiki_pages(), limit=batch_size)
     updated: list[dict] = []

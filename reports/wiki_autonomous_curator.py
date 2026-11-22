@@ -342,9 +342,9 @@ def run(
     run does not pay again for an unchanged candidate.
     """
     if llm_fn is None:
-        from agent_console.agent import _try_llm_prompt
+        from lib import llm_cli
 
-        llm_fn = _try_llm_prompt
+        llm_fn = llm_cli.default_maintenance_llm_fn()
 
     pages = wiki._all_wiki_pages()
     max_operations = max(1, min(20, int(limit))) if limit is not None else _max_operations()

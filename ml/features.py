@@ -469,6 +469,50 @@ def compute_features(
     return out
 
 
+# 원시 가격·거래량 레벨 컬럼 (auto_adjust=True 소급 분할 누수 + 명목 주가 암기 유발)
+NON_STATIONARY_LEVEL_COLS: frozenset[str] = frozenset({
+    "sma_5", "sma_10", "sma_20", "sma_50", "sma_200",
+    "ema_12", "ema_26", "ema_50",
+    "macd", "macd_signal", "macd_hist",
+    "bb_mid", "bb_upper", "bb_lower",
+    "bb_mid_20", "bb_upper_20", "bb_lower_20",
+    "atr_14",
+    "ichi_tenkan", "ichi_kijun", "ichi_senkou_a", "ichi_senkou_b",
+    "vol_sma_20", "obv",
+})
+import re as _re
+_NON_STATIONARY_PAT = _re.compile(r"^(?:sma|ema|atr|vol_sma)_\d+$|^bb_(?:mid|upper|lower)(?:_\d+)?$")
+
+
+def is_non_stationary_level_col(col: str) -> bool:
+    """가격·거래량 절대 레벨에 종속되는 컬럼인지 판별한다 (ema_bull_short 같은 정상 크로스오버 신호는 유지)."""
+    return col in NON_STATIONARY_LEVEL_COLS or bool(_NON_STATIONARY_PAT.match(col))
+
+
+def sanitize_ranker_features(features: pd.DataFrame, *, close: pd.Series | None = None) -> pd.DataFrame:
+    """횡단면 GBDT 랭커용 스케일·분할 불변 피처 정제기.
+
+    원시 가격/거래량 레벨 컬럼을 제거하고, close 대비 무차원 비율(atr_pct_14, macd_hist_pct,
+    close_vs_sma_200 등 중복 없는 MA 이격 비율)로 대체해 분할/명목주가 레벨 누수를 원천 차단한다.
+    """
+    out = features.copy()
+    if close is not None:
+        c = close.reindex(out.index).astype(float).replace(0.0, np.nan)
+        if "atr_14" in out.columns and "atr_pct_14" not in out.columns:
+            out["atr_pct_14"] = out["atr_14"] / c
+        if "macd_hist" in out.columns and "macd_hist_pct" not in out.columns:
+            out["macd_hist_pct"] = out["macd_hist"] / c
+        for w in (20, 50, 200):
+            col = f"sma_{w}"
+            # compute_features 가 이미 close_vs_sma20/50 을 생성하므로 완전 공선 중복 컬럼 추가를 피한다.
+            if col in out.columns and f"close_vs_sma{w}" not in out.columns and f"close_vs_sma_{w}" not in out.columns:
+                out[f"close_vs_sma_{w}"] = (c / out[col].replace(0.0, np.nan)) - 1.0
+    drop_cols = [col for col in out.columns if is_non_stationary_level_col(col)]
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Macro / news feature merge hooks
 # ---------------------------------------------------------------------------

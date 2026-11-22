@@ -70,8 +70,32 @@ def _current_phase() -> tuple[str, object]:
     return mt, pk
 
 
+_NON_EQUITY_META_KEYS = frozenset({
+    "SGOV", "QQQI", "QLD", "TQQQ", "SOXL", "UPRO", "BIL", "SHV", "GLD", "CASH", "cash",
+})
+
+
+def _equity_only_weights(weights: dict[str, float]) -> dict[str, float]:
+    """SGOV/QQQI/현금/레버리지 제외 주식 슬리브만 추출해 합계 1.0으로 정규화 (rule 과 공정 비교용)."""
+    import math
+    eq: dict[str, float] = {}
+    for t, w in weights.items():
+        if t in _NON_EQUITY_META_KEYS or isinstance(w, bool) or w is None:
+            continue
+        try:
+            fw = float(w)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fw) and fw > 0.001:
+            eq[t] = fw
+    tot = sum(eq.values())
+    if not math.isfinite(tot) or tot <= 0:
+        return {}
+    return {t: round(w / tot, 4) for t, w in eq.items()}
+
+
 def record_today(track: dict) -> None:
-    """오늘의 meta / rule 비중 기록 (이미 있으면 스킵)."""
+    """오늘의 meta / meta_equity / rule 비중 기록 (이미 있으면 스킵)."""
     today = datetime.now(KST).strftime("%Y-%m-%d")
     if today in track:
         logger.info("%s 이미 기록됨 — 스킵", today)
@@ -82,6 +106,7 @@ def record_today(track: dict) -> None:
     from ml.meta_allocator import get_meta_allocation
     alloc  = get_meta_allocation(mt, pk)
     meta_w = {t: round(w, 4) for t, w in alloc.weights.items() if w > 0.001}
+    meta_eq = _equity_only_weights(meta_w)
 
     # Phase 규칙 비중: ML 블렌딩 없는 원시 DCA 비중 (calculate_dca와 동일한 선택 로직)
     from barbell_strategy import load_dca_weights
@@ -93,6 +118,7 @@ def record_today(track: dict) -> None:
         "market_type": mt,
         "phase_key":   str(pk),
         "meta":        meta_w,
+        "meta_equity": meta_eq,
         "rule":        rule_w,
         "regime":      alloc.regime,
         "confidence":  round(alloc.confidence, 3),
@@ -101,7 +127,9 @@ def record_today(track: dict) -> None:
     # 레짐 코어(J) 후보 비중도 병행 기록 — backtest/regime_core_backtest.py 검증 로직
     # (200MA 추세 × vol타깃 25% × VIX텀 게이트, QLD↔QQQ↔SGOV 3-state)
     try:
-        entry["regime_core"] = _regime_core_weights()
+        rc = _regime_core_weights()
+        if rc:
+            entry["regime_core"] = rc
     except Exception as e:
         logger.warning("레짐 코어 비중 계산 실패: %s", e)
 
@@ -112,51 +140,18 @@ def record_today(track: dict) -> None:
 
 
 def _regime_core_weights() -> dict[str, float]:
-    """레짐 코어(N) 오늘 비중 — 앙상블 추세 × vol타깃 × VIX텀 × 금 방어슬리브.
-
-    위험자산 비중 = MA(50/100/150/200/250) 투표 비율 (점진 진입·청산, 타이밍 럭 완화)
-    그중 QLD 비율 = min(1, 0.25/QLD 실현변동성), 잔여 QQQ
-    방어슬리브(잔여) = SGOV 50% + GLD 50% (인플레형 약세장 대응)
-    VIX 백워데이션(VIX3M/VIX < 0.95) → 전량 방어슬리브
-    """
-    import numpy as np
+    """레짐 코어(N) 오늘 비중 — ml.mock_sweet_spot.us_n_weights 단일 구현 위임."""
     from ml.data_pipeline import fetch_prices
+    from ml.mock_sweet_spot import us_n_weights
 
-    px = fetch_prices(["QQQ", "QLD", "^VIX", "^VIX3M"], days=500)
-    qqq = px["QQQ"]["Close"].dropna()
-    qld = px["QLD"]["Close"].dropna()
-
-    vix   = px.get("^VIX", {}).get("Close")
-    vix3m = px.get("^VIX3M", {}).get("Close")
-    term_ok = True
-    if vix is not None and vix3m is not None:
-        v, v3 = vix.dropna(), vix3m.dropna()
-        if not v.empty and not v3.empty and float(v.iloc[-1]) > 0:
-            term_ok = float(v3.iloc[-1]) / float(v.iloc[-1]) >= 0.95
-    if not term_ok:
-        return {"SGOV": 0.5, "GLD": 0.5}
-
-    votes = 0.0
-    for n in (50, 100, 150, 200, 250):
-        ma = qqq.rolling(n, min_periods=n).mean()
-        if np.isfinite(ma.iloc[-1]) and float(qqq.iloc[-1]) > float(ma.iloc[-1]):
-            votes += 1
-    risk = votes / 5.0
-    if risk <= 0:
-        return {"SGOV": 0.5, "GLD": 0.5}
-
-    vol = float(qld.pct_change().rolling(20).std().iloc[-1]) * (252 ** 0.5)
-    lev_frac = min(1.0, 0.25 / vol) if np.isfinite(vol) and vol > 1e-6 else 0.0
-    w_l = round(risk * lev_frac, 4)
-    w_q = round(risk - w_l, 4)
-    out = {}
-    if w_l > 0: out["QLD"] = w_l
-    if w_q > 0: out["QQQ"] = w_q
-    defensive = round(1 - w_l - w_q, 4)
-    if defensive > 0:   # 방어슬리브: SGOV 50% + GLD 50%
-        out["SGOV"] = round(defensive / 2, 4)
-        out["GLD"]  = round(defensive - out["SGOV"], 4)
-    return out
+    px = fetch_prices(["QQQ", "QLD", "SGOV", "GLD", "^VIX", "^VIX3M"], days=500)
+    closes = {
+        t: df["Close"]
+        for t, df in px.items()
+        if df is not None and not getattr(df, "empty", True) and "Close" in df.columns
+    }
+    raw = us_n_weights(closes)
+    return {t: round(float(w), 4) for t, w in raw.items() if float(w) > 0}
 
 
 CASH_KEYS = frozenset({"CASH", "cash"})
@@ -209,14 +204,15 @@ def fill_realized(track: dict) -> int:
     pending = [
         (d, e) for d, e in track.items()
         if ("ret_meta_20d" not in e or "ret_meta_5d" not in e
-            or ("regime_core" in e and "ret_regime_core_20d" not in e))
+            or (e.get("meta_equity") and ("ret_meta_equity_5d" not in e or "ret_meta_equity_20d" not in e))
+            or (e.get("regime_core") and ("ret_regime_core_5d" not in e or "ret_regime_core_20d" not in e)))
     ]
     if not pending:
         return 0
 
     tickers = set()
     for _, e in pending:
-        tickers |= set(e["meta"]) | set(e["rule"]) | set(e.get("regime_core", {}))
+        tickers |= set(e["meta"]) | set(e["rule"]) | set(e.get("meta_equity", {})) | set(e.get("regime_core", {}))
 
     from ml.data_pipeline import fetch_prices
     prices = fetch_prices(sorted(tickers), days=120)
@@ -226,8 +222,8 @@ def fill_realized(track: dict) -> int:
     for d, e in pending:
         changed = False
         for horizon, key in ((5, "5d"), (20, "20d")):
-            for side in ("meta", "rule", "regime_core"):
-                if side not in e:
+            for side in ("meta", "meta_equity", "rule", "regime_core"):
+                if not e.get(side):
                     continue
                 field = f"ret_{side}_{key}"
                 if field in e:

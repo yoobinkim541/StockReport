@@ -1070,6 +1070,8 @@ def build_stock_features(
     market_features: pd.DataFrame,
     qqq_close: pd.Series | None = None,
     sector_id: int = 0,
+    *,
+    scale_free: bool = True,
 ) -> pd.DataFrame:
     """단일 종목 전체 피처 생성.
 
@@ -1084,11 +1086,7 @@ def build_stock_features(
       종목고유   : QQQ 초과모멘텀(60d), beta_60d, 섹터ID, 생존편향페널티
       시장공통   : fg_score, vix (market_features에서 병합)
     """
-    from ml.features import (
-        compute_features, stochastic, williams_r, cci, disparity,
-        obv, cmf, price_acceleration, vol_of_vol,
-        ichimoku_signals, ma_cross_signals,
-    )
+    from ml.features import compute_features, sanitize_ranker_features
 
     if len(price_df) < 60:
         return pd.DataFrame()
@@ -1101,8 +1099,10 @@ def build_stock_features(
         "Close": "close", "Volume": "volume",
     })
 
-    # ── 기술적 피처 전체 세트 ──────────────────────────────────────────────
+    # ── 기술적 피처 전체 세트 (기본 scale_free=True 로 분할/주가레벨 누수 차단) ──
     tech = compute_features(df_feat, include_ichimoku=True, include_atr=True)
+    if scale_free:
+        tech = sanitize_ranker_features(tech, close=df_feat["close"])
 
     # ── 종목 고유 피처 ─────────────────────────────────────────────────────
     extra = pd.DataFrame(index=close.index)

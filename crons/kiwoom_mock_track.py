@@ -620,12 +620,13 @@ def _classify_kind(side: str, qty: int, cur_shares: int) -> str:
 
 
 def _log_decision(ledger, sig: dict, code: str, kind: str, order_side: str,
-                  qty: int, ok, today: str) -> None:
+                  qty: int, ok, today: str, *, strategy_regime: str = "kr_mock") -> None:
     """결정+근거를 불변 원장(kr_decisions.jsonl)에 적재 + 편입/퇴출은 MD 저널에도."""
     from ml.recommendation_surfaces import decision_metadata
     try:
         ledger.log_decision({
             **decision_metadata(sig.get("recommendation_v2_shadow", {}), selection_status="selected"),
+            "strategy_regime": strategy_regime,
             "date": today,
             "ticker": sig.get("ticker", f"{code}.KS"),
             "code": code,
@@ -955,7 +956,11 @@ def main(argv: list[str] | None = None) -> int:
     cash = bal["cash_krw"]
     nav = float(bal["nav"])
 
+    import copy
+
     signals = compute_kr_signals(UNIVERSE) or []
+    # 장점 앙상블/스위트스팟 덮어쓰기 전에 원시 종목정책 점수를 깊은 복사해 스냅샷 (kr_mock_shadow 오염 차단)
+    base_signals_for_shadow = copy.deepcopy(signals)
     book = advantage_book()
     if not signals and not book.get("ok"):
         logger.warning("신호 0건 — 종료")
@@ -972,11 +977,14 @@ def main(argv: list[str] | None = None) -> int:
     tranches = TRANCHES
     target_weights = None
     pos_n = MAX_POS
+    advantage_active = False
+    sweet_spot_active = False
     if book.get("ok"):
         signals = _merge_advantage(signals, book)
         target_weights = book.get("weights") or {}
         min_hold = 0
         tranches = 1
+        advantage_active = True
         logger.info(
             "장점 앙상블 적용 asof=%s 종목 %d 현금 %.0f%% 슬리브 %s",
             book.get("asof"), len(target_weights), 100 * float(book.get("cash") or 0),
@@ -989,6 +997,7 @@ def main(argv: list[str] | None = None) -> int:
             signals, sweet_n = apply_kr_signals(signals, exit_buffer=EXIT_BUFFER)
             if sweet_n:
                 pos_n = sweet_n
+                sweet_spot_active = True
                 logger.info("스위트스팟 KR: mom12+lowvol 50%% + lowvol+hi52 50%%, 목표 %d종목 "
                             "(KR_MOCK_MAX_POS=%d 미적용 · 유예 상위 5+%d)", sweet_n, MAX_POS, EXIT_BUFFER)
             else:
@@ -1026,18 +1035,24 @@ def main(argv: list[str] | None = None) -> int:
 
     from ml.adaptive import Ledger
     ledger = Ledger("kr_mock")
+    strategy_regime = resolve_ledger_surface(
+        advantage_active=advantage_active, sweet_spot_active=sweet_spot_active,
+    )
     llm_shadow_ledger = Ledger("kr_mock_llm_shadow")
     sig_by_code = {s["code"]: s for s in signals}
     today = datetime.now(KST).strftime("%Y-%m-%d")
 
-    # ★랭킹 섀도 — 주문 여부와 무관하게 점수화된 **전 후보**를 별도 표면에 적재.
-    # 라이브는 상위 3종목만 거래해 원장에 남는 표본이 극소수이고(콜드스타트 정체),
-    # 상위만 남으면 점수 분산이 잘려 IC 가 구조적으로 감쇠한다(구간 제한) — 섀도는
-    # 선택편향 없는 전 구간 IC 측정용. 주문·회전율·비용에는 전혀 영향 없음.
+    # ★랭킹 섀도 — 장점/스위트스팟 덮어쓰기 이전 원시 종목정책 스냅샷으로 전 구간 IC 측정.
     from lib import rank_shadow
     _shadow_n = rank_shadow.log_ranked_candidates(
-        Ledger("kr_mock_shadow"), signals, today=today, market="KR")
-    logger.info("랭킹 섀도 적재: %d건 (유니버스 %d)", _shadow_n, len(signals))
+        Ledger("kr_mock_shadow"), base_signals_for_shadow, today=today, market="KR")
+    # log_ranked_candidates 가 base_signals_for_shadow 에 주입한 recommendation_v2_shadow 메타를
+    # 실제 주문 원장 기록용 sig_by_code 에도 복사해 selection_rank/data_quality/evidence_refs 를 보존한다.
+    for _bs in base_signals_for_shadow:
+        _code = _bs.get("code")
+        if _code and _code in sig_by_code and "recommendation_v2_shadow" in _bs:
+            sig_by_code[_code]["recommendation_v2_shadow"] = copy.deepcopy(_bs["recommendation_v2_shadow"])
+    logger.info("랭킹 섀도 적재: %d건 (유니버스 %d)", _shadow_n, len(base_signals_for_shadow))
 
     llm_payload = llm_exec.build_order_review_payload(
         market="KR", nav=nav, cash=cash, budget=budget, max_positions=pos_n,
@@ -1095,7 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
         _append_history({"kind": "order", "code": o["code"], "side": o["side"], "qty": o["qty"],
                          "reason": o.get("reason"), "ok": r.get("ok"), "msg": r.get("msg")})
         _log_decision(ledger, sig_by_code.get(o["code"], {}), o["code"], kind, o["side"],
-                      o["qty"], r.get("ok"), today)
+                      o["qty"], r.get("ok"), today, strategy_regime=strategy_regime)
         if not r.get("ok") and _order_blocker(r.get("msg")):
             logger.error("전 주문 공통 차단(%s) 감지 — 남은 주문 중단: %s",
                          _order_blocker(r.get("msg")), r.get("msg"))
@@ -1108,6 +1123,18 @@ def main(argv: list[str] | None = None) -> int:
     _notify(nav, results, signals, llm_note=note)
     logger.info("=== 완료: 집행 %d건 ===", sum(1 for r in results if r.get("ok")))
     return 0
+
+
+def resolve_ledger_surface(*, advantage_active: bool, sweet_spot_active: bool) -> str:
+    """실행 원장(`kr_mock`) 각 결정 행의 `strategy_regime` 태그를 반환한다.
+
+    `kr_mock_learn` 은 이 태그로 장점 앙상블·스위트스팟 주문을 걸러내고 순수 종목정책(`kr_mock`)만 학습한다.
+    """
+    if advantage_active:
+        return "kr_advantage"
+    if sweet_spot_active:
+        return "kr_sweet_spot"
+    return "kr_mock"
 
 
 if __name__ == "__main__":

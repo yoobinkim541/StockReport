@@ -38,17 +38,79 @@ MIN_SAMPLES = 15          # paper_track 은 희소 → 보수적 최소 표본
 BLEND_MAX = 0.6           # blend 상한(기존 _phase_blend_factor 최대와 일치)
 
 
-def _samples(track: dict, horizon: str = "5d") -> list[tuple[float, float]]:
-    """성숙 항목 → [(ret_meta, ret_rule)]."""
-    mk, rk = f"ret_meta_{horizon}", f"ret_rule_{horizon}"
-    out = []
-    for _, e in sorted(track.items()):
-        if e.get(mk) is None or e.get(rk) is None:
+def _horizon_calendar_step(horizon: str) -> int:
+    """거래일 horizon 을 공휴일 1~2일 포함 비중첩 달력일 간격으로 환산한다."""
+    import math
+    import re
+    m = re.match(r"^(\d+)", str(horizon or "").strip())
+    td = int(m.group(1)) if m else 5
+    # 5거래일 -> 8일(MLK/공휴일 낀 1주 overlap 차단), 20거래일 -> 30일
+    return max(7, int(math.ceil(td * 7 / 5)) + (1 if td <= 10 else 2))
+
+
+def _finite_real(val) -> float | None:
+    import math
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        fv = float(val)
+    except (TypeError, ValueError):
+        return None
+    return fv if math.isfinite(fv) else None
+
+
+def _samples(
+    track: dict,
+    horizon: str = "5d",
+    *,
+    non_overlapping: bool = False,
+) -> list[tuple[float, float]]:
+    """성숙 항목 → [(ret_meta, ret_rule)].
+
+    동일 자산군 공정 비교를 위해 `meta_equity` 필드가 존재하는 신형 엔트리에서는
+    반드시 주식 전용 슬리브(`ret_meta_equity_{horizon}`)만 사용한다(100% 현금/채권일에
+    `ret_meta_{horizon}` 로 폴백해 현금 쿠션 편향이 재유입되는 현상 차단).
+    `meta_equity` 자체가 없는 구형 엔트리에서만 `ret_meta_{horizon}` 으로 폴백한다.
+    `non_overlapping=True` 이면 ISO 날짜 파싱 실패 행을 제외(fail-closed)하고
+    날짜순 정렬 뒤 유효 행이 채택될 때만 horizon 간격 커서를 전진시킨다.
+    """
+    eq_mk, mk, rk = f"ret_meta_equity_{horizon}", f"ret_meta_{horizon}", f"ret_rule_{horizon}"
+    step_days = _horizon_calendar_step(horizon)
+
+    parsed_rows: list[tuple[datetime | None, str, dict]] = []
+    for date_str, e in track.items():
+        if not isinstance(e, dict):
             continue
+        cur_dt: datetime | None = None
         try:
-            out.append((float(e[mk]), float(e[rk])))
-        except (TypeError, ValueError):
+            cur_dt = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+        except ValueError:
+            if non_overlapping:
+                continue   # fail-closed: 비표준 날짜가 비중첩 게이트를 우회하지 못하게 차단
+        parsed_rows.append((cur_dt, str(date_str), e))
+
+    if non_overlapping:
+        parsed_rows.sort(key=lambda item: (item[0] or datetime.min, item[1]))
+    else:
+        parsed_rows.sort(key=lambda item: item[1])
+
+    out: list[tuple[float, float]] = []
+    last_dt: datetime | None = None
+    for cur_dt, _date_str, e in parsed_rows:
+        if "meta_equity" in e:
+            m_raw = e.get(eq_mk)
+        else:
+            m_raw = e.get(eq_mk) if e.get(eq_mk) is not None else e.get(mk)
+        r_raw = e.get(rk)
+        m_val = _finite_real(m_raw)
+        r_val = _finite_real(r_raw)
+        if m_val is None or r_val is None:
             continue
+        if non_overlapping and cur_dt is not None:
+            if last_dt is not None and (cur_dt - last_dt).days < step_days:
+                continue
+            last_dt = cur_dt
+        out.append((m_val, r_val))
     return out
 
 
@@ -107,7 +169,7 @@ def main() -> int:
         logger.warning("paper_track 로드 실패: %s", e)
         return 0
 
-    ev = evaluate(_samples(track))
+    ev = evaluate(_samples(track, non_overlapping=True))
     enabled = os.getenv("ADAPTIVE_ADVICE_ENABLED", "false").lower() == "true"
     lines = ["🧭 포트폴리오 advice 적응 평가 (MetaAllocator A/B)", "━━━━━━━━━━━━━━"]
     if ev.get("n", 0) < MIN_SAMPLES:

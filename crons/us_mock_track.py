@@ -820,6 +820,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from ml.adaptive import Ledger
     ledger = Ledger("us_mock")
+    strategy_regime = resolve_ledger_surface(sweet_spot_active=sweet_orders is not None)
     llm_shadow_ledger = Ledger("us_mock_llm_shadow")
     sig_by = {s["ticker"]: s for s in signals}
     if sweet_orders is not None:
@@ -900,7 +901,8 @@ def main(argv: list[str] | None = None) -> int:
                 confirmed=True,
                 note=o.get("reason", ""),
             )
-        _log_decision(ledger, s, o["symbol"], kind, o["side"], o["qty"], r.get("ok"), today)
+        _log_decision(ledger, s, o["symbol"], kind, o["side"], o["qty"], r.get("ok"), today,
+                      strategy_regime=strategy_regime)
         logger.info("%s(%s) %s %s주 → %s %s", o["side"], kind, o["symbol"], o["qty"],
                     "OK" if r.get("ok") else "FAIL", r.get("msg", ""))
         time.sleep(0.4)   # KIS 레이트리밋
@@ -915,12 +917,20 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _log_decision(ledger, sig, sym, kind, order_side, qty, ok, today):
+def resolve_ledger_surface(*, sweet_spot_active: bool) -> str:
+    """실행 원장(`us_mock`) 각 결정 행의 `strategy_regime` 태그를 반환한다.
+
+    `us_mock_learn` 은 이 태그로 스위트스팟 ETF 주문을 걸러내고 순수 종목정책(`us_mock`)만 학습한다.
+    """
+    return "us_sweet_spot" if sweet_spot_active else "us_mock"
+
+
+def _log_decision(ledger, sig, sym, kind, order_side, qty, ok, today, *, strategy_regime: str = "us_mock"):
     from ml.recommendation_surfaces import decision_metadata
     try:
         ledger.log_decision({
             **decision_metadata(sig.get("recommendation_v2_shadow", {}), selection_status="selected"),
-            "date": today, "ticker": sym, "side": kind, "order_side": order_side, "qty": qty,
+            "strategy_regime": strategy_regime, "date": today, "ticker": sym, "side": kind, "order_side": order_side, "qty": qty,
             "price": sig.get("price"), "base_score": sig.get("base_score"),
             "policy_score": sig.get("policy_score"),
             "selection_score": sig.get("selection_score"),

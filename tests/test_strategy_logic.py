@@ -163,9 +163,9 @@ def test_phase_blend_factor_bull_keys():
 
 
 def test_phase_blend_factor_bear_and_neutral():
-    assert bs._phase_blend_factor("bear", 5) == 0.60
-    assert bs._phase_blend_factor("bear", 0) == 0.3
-    assert bs._phase_blend_factor("neutral", 0) == 0.3
+    assert bs._phase_blend_factor("bear", 5) == 0.25
+    assert bs._phase_blend_factor("bear", 0) == 0.2
+    assert bs._phase_blend_factor("neutral", 0) == 0.2
 
 
 # ══════════════════════════════════════════════════════════════════════

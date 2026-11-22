@@ -49,14 +49,84 @@ def _price_feats(closes, event_date):
     return window_feats(closes, event_date)
 
 
+def lookup_pit_snapshot(
+    snapshots: list[dict],
+    ticker: str,
+    event_date: str,
+    field: str,
+    *,
+    max_age_days: int = 45,
+) -> float | None:
+    """event_date 이전(<) 가장 최근 스냅샷의 field 값을 반환한다 (당일·미래 누수 차단)."""
+    import datetime as _dt
+    import math
+
+    if not snapshots or not ticker or not event_date:
+        return None
+    try:
+        ev_d = _dt.date.fromisoformat(str(event_date)[:10])
+    except ValueError:
+        return None
+    tk_u = str(ticker).strip().upper()
+    best_day: _dt.date | None = None
+    best_val: float | None = None
+    for row in snapshots:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("ticker") or "").strip().upper() != tk_u:
+            continue
+        raw_v = row.get(field)
+        if raw_v is None or isinstance(raw_v, bool):
+            continue
+        try:
+            sd = _dt.date.fromisoformat(str(row.get("date") or "")[:10])
+            fv = float(raw_v)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(fv):
+            continue
+        age = (ev_d - sd).days
+        if age <= 0 or age > max_age_days:
+            continue
+        if best_day is None or sd > best_day:
+            best_day, best_val = sd, fv
+    return best_val
+
+
+SNAP_PATH = Path(os.path.expanduser("~/reports/ml-cache/earnings_snapshots.jsonl"))
+
+
+def _load_pit_snapshots(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    import json
+    out: list[dict] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
 def build_training_set(tickers: list[str], *, min_prior: int = 3, limit: int = 20):
-    """yfinance 과거 서프라이즈 + 가격 → (rows, labels, meta). label=beat(서프라이즈>0). 시간순.
+    """yfinance 과거 서프라이즈 + 가격 + PIT 어닝 스냅샷 → (rows, labels, meta). 시간순.
 
     각 이벤트는 직전 서프라이즈 min_prior 개 이상일 때만 포함(워밍업).
     """
     from providers import earnings_data as ed
     from lib.price_utils import fetch_closes
 
+    snaps = _load_pit_snapshots(SNAP_PATH)
     rows, labels, meta = [], [], []
     for tk in tickers:
         try:
@@ -72,7 +142,8 @@ def build_training_set(tickers: list[str], *, min_prior: int = 3, limit: int = 2
             ev = hist[i]
             prior = [hist[j]["surprise_pct"] for j in range(i)]
             mom, vol = _price_feats(closes, ev["date"]) if closes is not None else (None, None)
-            rows.append({"features": event_features(prior, mom, vol)})
+            rev = lookup_pit_snapshot(snaps, tk, ev["date"], "revision_momentum")
+            rows.append({"features": event_features(prior, mom, vol, rev)})
             labels.append(1 if ev["surprise_pct"] > 0 else 0)
             meta.append({"ticker": tk, "date": ev["date"]})
     order = sorted(range(len(rows)), key=lambda i: meta[i]["date"])
@@ -98,16 +169,23 @@ def train(rows: list[dict], labels: list[int], *, time_split: float = 0.7) -> di
         return {"model": None, "n": n, "reason": f"라이브러리 없음: {e}"}
     X, y = np.array(_matrix(rows), float), np.array(labels, int)
     s = int(n * time_split)
-    if y[:s].sum() < 8 or y[s:].sum() < 3 or len(set(y[s:].tolist())) < 2:
+    if y[:s].sum() < 8 or y[s:].sum() < 3 or len(set(y[:s].tolist())) < 2 or len(set(y[s:].tolist())) < 2:
         return {"model": None, "n": n, "n_pos": int(n_pos), "reason": "분할 후 클래스 부족 — 보류"}
+    clf_oos = LGBMClassifier(n_estimators=150, learning_rate=0.05, num_leaves=15,
+                             min_child_samples=15, subsample=0.8, subsample_freq=1,
+                             random_state=42, verbose=-1)
+    clf_oos.fit(X[:s], y[:s])
+    auc = float(roc_auc_score(y[s:], clf_oos.predict_proba(X[s:])[:, 1]))
+    # OOS 검증 완료 후 최근 30% 데이터를 버리지 않도록 전 구간 재적합
     clf = LGBMClassifier(n_estimators=150, learning_rate=0.05, num_leaves=15,
-                         min_child_samples=15, verbose=-1)
-    clf.fit(X[:s], y[:s])
-    auc = float(roc_auc_score(y[s:], clf.predict_proba(X[s:])[:, 1]))
+                         min_child_samples=15, subsample=0.8, subsample_freq=1,
+                         random_state=42, verbose=-1)
+    clf.fit(X, y)
     imp = dict(zip(FEATURE_COLS, [int(v) for v in clf.feature_importances_]))
     return {"model": clf, "oos_auc": round(auc, 3), "n": n, "n_pos": int(n_pos),
             "base_rate": round(n_pos / n, 3), "feature_importance": imp,
-            "reason": f"학습 완료 — OOS AUC {auc:.3f} (beat base rate {n_pos/n:.2f})"}
+            "fit_scope": "all_labeled",
+            "reason": f"학습 완료 — OOS AUC {auc:.3f} (beat base rate {n_pos/n:.2f}, 전구간 재적합)"}
 
 
 def predict_beat(model, rows: list[dict]) -> list[float]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import functools
 import fcntl
 import json
@@ -21,7 +22,11 @@ from typing import Any, Iterable
 import safe_io
 
 from . import evidence_usage, qmd_search, shared_memory, storage
-from . import wiki_contract, wiki_ontology
+from . import wiki_contract, wiki_index, wiki_ontology, wiki_usage_store
+
+_USAGE_BATCH_CTX: contextvars.ContextVar[dict[str, dict[str, Any]] | None] = contextvars.ContextVar(
+    "_USAGE_BATCH_CTX", default=None,
+)
 
 
 WIKI_TAG = "wiki"
@@ -45,17 +50,37 @@ MAX_MERGE_SOURCES = 8
 MAX_WIKI_REVISION_BYTES = 1_000_000
 
 
-def _cache_storage_signature() -> str:
-    """외부 프로세스가 events.jsonl을 갱신해도 읽기 캐시가 즉시 무효화되게 한다."""
+def _events_storage_signature() -> str:
+    """events.jsonl 변경만 추적해 사용량 사이드카 갱신 시 20MB JSONL 재파싱을 피한다."""
+    events_path = Path(shared_memory._paths()["events"])
     try:
-        path = Path(shared_memory.shared_memory_dir()) / "events.jsonl"
-        stat = path.stat()
-        return f"{stat.st_mtime_ns}:{stat.st_size}"
+        st = events_path.stat()
+        return f"{st.st_ino}:{st.st_mtime_ns}:{st.st_size}"
     except OSError:
-        return "missing"
+        return "0"
 
 
-def _cached(key_prefix: str, ttl: float = _CACHE_TTL):
+def _cache_storage_signature() -> str:
+    """외부 프로세스가 events.jsonl 또는 wiki_usage.sqlite를 갱신해도 읽기 캐시가 즉시 무효화되게 한다."""
+    base = Path(shared_memory.shared_memory_dir())
+    parts: list[str] = [_events_storage_signature()]
+    for name in ("wiki_usage.sqlite", "wiki_usage.sqlite-wal"):
+        try:
+            st = (base / name).stat()
+            parts.append(f"{st.st_ino}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append("0")
+    return "|".join(parts)
+
+
+def _clear_usage_derived_cache() -> None:
+    """사용량·피드백 사이드카 갱신 시 파생 페이지 캐시만 비우고 raw events 캐시는 유지한다."""
+    for key in list(_CACHE.keys()):
+        if not key.startswith("wiki_records:"):
+            _CACHE.pop(key, None)
+
+
+def _cached(key_prefix: str, ttl: float = _CACHE_TTL, sig_fn: Callable[[], str] = _cache_storage_signature):
     """결과를 TTL 동안 재사용한다.
 
     args/kwargs가 리스트·딕셔너리(예: lint_pages의 pages 인자)를 포함할 수 있어
@@ -64,7 +89,7 @@ def _cached(key_prefix: str, ttl: float = _CACHE_TTL):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            k = f"{key_prefix}:{_cache_storage_signature()}:{args!r}:{sorted(kwargs.items())!r}"
+            k = f"{key_prefix}:{sig_fn()}:{args!r}:{sorted(kwargs.items())!r}"
             now = time.monotonic()
             cached = _CACHE.get(k)
             if cached and (now - cached[0]) < ttl:
@@ -415,7 +440,11 @@ def _save_split_wiki_page(page: dict, *, body_limit: int = WIKI_BODY_LIMIT) -> d
 
 
 def _prepare_split_records(page: dict, *, records: list[dict], body_limit: int = WIKI_BODY_LIMIT) -> list[dict]:
-    existing_by_id = {row["id"]: _record_to_page(row) for row in records}
+    token = _USAGE_BATCH_CTX.set(wiki_usage_store.get_all_usage())
+    try:
+        existing_by_id = {row["id"]: _record_to_page(row) for row in records}
+    finally:
+        _USAGE_BATCH_CTX.reset(token)
     page = dict(page or {})
     stored_page = page.get("raw") if isinstance(page.get("raw"), dict) else None
     body_source = stored_page.get("body") if stored_page else page.get("body")
@@ -711,7 +740,7 @@ def _is_wiki_record(record: dict) -> bool:
     return surface == WIKI_SURFACE
 
 
-@_cached("wiki_records")
+@_cached("wiki_records", sig_fn=_events_storage_signature)
 def _wiki_records() -> list[dict]:
     try:
         rows = shared_memory.all_records()
@@ -720,10 +749,25 @@ def _wiki_records() -> list[dict]:
     return [row for row in rows if _is_wiki_record(row)]
 
 
+def _raw_wiki_record(page_id: str) -> dict | None:
+    page_id = _clean(page_id, 80)
+    if not page_id:
+        return None
+    for row in _wiki_records():
+        if row.get("id") == page_id:
+            return row
+    return None
+
+
 @_cached("all_wiki_pages")
 def _all_wiki_pages() -> list[dict]:
     records = _wiki_records()
-    return _apply_backlinks([_record_to_page(row) for row in records], records)
+    token = _USAGE_BATCH_CTX.set(wiki_usage_store.get_all_usage())
+    try:
+        pages = [_record_to_page(row) for row in records]
+    finally:
+        _USAGE_BATCH_CTX.reset(token)
+    return _apply_backlinks(pages, records)
 
 
 def _backlink_index(records: list[dict]) -> dict[str, list[str]]:
@@ -792,6 +836,36 @@ def _record_to_page(record: dict) -> dict:
     source_refs = shared_memory.normalize_artifact_refs(record.get("artifacts") or [])
     status = normalize_trust_status(_status_from_tags(tags), source_refs)
     warnings = trust_warnings_for(status, source_refs)
+    page_id_str = _clean(record.get("id"), 80)
+    batch_usage = _USAGE_BATCH_CTX.get()
+    if batch_usage is not None:
+        sidecar = batch_usage.get(page_id_str)
+    else:
+        sidecar = wiki_usage_store.get_usage(page_id_str) if page_id_str else None
+    base_use_count = _safe_count(record.get("useCount"))
+    base_last_used = str(record.get("lastUsedAt") or "")
+    base_last_query = str(record.get("lastQuery") or "")
+    merged_feedback: dict[str, int] = {}
+    raw_feedback = record.get("feedback")
+    if isinstance(raw_feedback, dict):
+        for k, v in raw_feedback.items():
+            merged_feedback[str(k)] = _safe_count(v)
+    if sidecar:
+        use_count = base_use_count + int(sidecar.get("use_delta") or 0)
+        sc_last_used = str(sidecar.get("last_used_at") or "")
+        sc_last_query = str(sidecar.get("last_query") or "")
+        if sc_last_used and sc_last_used >= base_last_used:
+            last_used_at = sc_last_used
+            last_query = sc_last_query or base_last_query
+        else:
+            last_used_at = base_last_used
+            last_query = base_last_query
+        for k, v in (sidecar.get("feedback_delta") or {}).items():
+            merged_feedback[str(k)] = merged_feedback.get(str(k), 0) + int(v or 0)
+    else:
+        use_count = base_use_count
+        last_used_at = base_last_used
+        last_query = base_last_query
     return {
         "id": record.get("id"),
         "title": _clean(record.get("title") or "위키 페이지", 160),
@@ -810,9 +884,9 @@ def _record_to_page(record: dict) -> dict:
         "confidence": _safe_confidence(record.get("confidence") or source.get("confidence")),
         "created_at": record.get("createdAt") or "",
         "updated_at": record.get("updatedAt") or record.get("createdAt") or "",
-        "useCount": _safe_count(record.get("useCount")),
-        "lastUsedAt": record.get("lastUsedAt") or "",
-        "lastQuery": record.get("lastQuery") or "",
+        "useCount": use_count,
+        "lastUsedAt": last_used_at,
+        "lastQuery": last_query,
         "source": source,
         "source_refs": source_refs,
         "links": _clean_links(record.get("links") or [], self_id=_clean(record.get("id"), 80)),
@@ -829,7 +903,7 @@ def _record_to_page(record: dict) -> dict:
         "distillation_state": distillation_state,
         "messages": messages,
         "source_knowledge": deepcopy(record.get("source_knowledge") or {}),
-        "feedback": record.get("feedback") or {},
+        "feedback": merged_feedback,
         "snippet": summary[:260] if summary else "",
         "raw": record,
     }
@@ -852,9 +926,8 @@ def _knowledge_search_text(knowledge: object) -> str:
     return " ".join(values)
 
 
-def _candidate_score(record: dict, query: str, surface: str, status: str,
-                     *, include_document_content: bool = False) -> int:
-    page = _record_to_page(record)
+def _score_normalized_page(page: dict, query: str, surface: str, status: str,
+                           *, include_document_content: bool = False) -> int:
     haystack = " ".join(
         [
             page["title"],
@@ -885,6 +958,14 @@ def _candidate_score(record: dict, query: str, surface: str, status: str,
     except Exception:
         pass
     return score
+
+
+def _candidate_score(record: dict, query: str, surface: str, status: str,
+                     *, include_document_content: bool = False) -> int:
+    return _score_normalized_page(
+        _record_to_page(record), query, surface, status,
+        include_document_content=include_document_content,
+    )
 
 
 def _tokens(text: str) -> set[str]:
@@ -928,32 +1009,47 @@ def list_pages(*, query: str = "", surface: str = "all", status: str = "all", li
         )
         return pages[:limit]
 
-    records = _wiki_records()
-    if not include_archived:
-        records = [row for row in records if not _record_is_archived(row)]
+    all_records = _wiki_records()
+    records = all_records if include_archived else [row for row in all_records if not _record_is_archived(row)]
     if not records:
         return []
     # The knowledge view drops a page whose title repeats a higher-ranked one: on 2026-11-18, 170 title groups among
     # active market pages were mostly a source's note page plus a page named like it, and both took context slots.
     fetch = limit if include_archived else limit * 2
-    fallback = _fallback_ranked_pages(records, query=query, surface=surface, status=status, limit=fetch)
-    qmd_pages = _qmd_ranked_pages(records, query=query, surface=surface, status=status, limit=fetch)
     merged: list[dict] = []
     seen: set[str] = set()
     titles: set[str] = set()
-    for page in [*qmd_pages, *fallback]:
-        page_id = _clean(page.get("id"), 120)
-        title = " ".join(unicodedata.normalize("NFKC", str(page.get("title") or "")).casefold().split())
-        if (page_id and page_id in seen) or (not include_archived and title and title in titles):
-            continue
-        if page_id:
-            seen.add(page_id)
-        titles.add(title)
-        merged.append(page)
-        if len(merged) >= limit:
-            break
+
+    def _absorb(candidates: list[dict]) -> None:
+        for page in candidates:
+            page_id = _clean(page.get("id"), 120)
+            title = " ".join(unicodedata.normalize("NFKC", str(page.get("title") or "")).casefold().split())
+            if (page_id and page_id in seen) or (not include_archived and title and title in titles):
+                continue
+            if page_id:
+                seen.add(page_id)
+            titles.add(title)
+            merged.append(page)
+            if len(merged) >= limit:
+                break
+
+    token = _USAGE_BATCH_CTX.set(wiki_usage_store.get_all_usage())
+    try:
+        qmd_pages = _qmd_ranked_pages(records, query=query, surface=surface, status=status, limit=fetch)
+        # FTS5 인덱스에는 아카이브 포함 전체 레코드를 넘겨 include_archived 토글로 인한 불필요한 재색인을 막는다.
+        fts_pages = _fts_ranked_pages(
+            all_records, query=query, surface=surface, status=status,
+            include_archived=include_archived, limit=fetch,
+        )
+        _absorb([*qmd_pages, *fts_pages])
+        if len(merged) < limit:
+            fallback = _fallback_ranked_pages(records, query=query, surface=surface, status=status, limit=fetch)
+            _absorb(fallback)
+    finally:
+        _USAGE_BATCH_CTX.reset(token)
     pages = _apply_backlinks(merged, records)
-    _record_retrieval_usage(query, surface, status, pages, provider="qmd" if qmd_pages else "fallback")
+    provider = "qmd" if qmd_pages else ("fts5" if fts_pages else "fallback")
+    _record_retrieval_usage(query, surface, status, pages, provider=provider)
     return pages
 
 
@@ -971,7 +1067,7 @@ def _record_retrieval_usage(query: str, surface: str, status: str, pages: list[d
             query_id,
             [str(page.get("id") or "") for page in pages],
             provider,
-            provider != "qmd",
+            provider not in {"qmd", "fts5"},
         )
     except Exception:
         pass
@@ -979,6 +1075,41 @@ def _record_retrieval_usage(query: str, surface: str, status: str, pages: list[d
         "retrieval", title=f"{surface} wiki retrieval", query_id=query_id,
         page_ids=[str(page.get("id") or "") for page in pages], provider=provider, surface=surface,
     )
+
+
+def _fts_ranked_pages(records: list[dict], *, query: str, surface: str, status: str,
+                      include_archived: bool, limit: int) -> list[dict]:
+    """SQLite FTS5 BM25 1차 하이브리드 검색 결과 → 정규화 페이지 목록."""
+    if not query:
+        return []
+    try:
+        hits = wiki_index.search_pages(
+            query, records=records, surface=surface, status=status,
+            include_archived=include_archived, limit=limit,
+        )
+    except Exception:
+        return []
+    if not hits:
+        return []
+    by_id = {_clean(row.get("id"), 120): row for row in records if row.get("id")}
+    out: list[dict] = []
+    for hit in hits:
+        row = by_id.get(_clean(hit.get("id"), 120))
+        if not row:
+            continue
+        page = _record_to_page(row)
+        if status and status != "all" and page["status"] != status.lower():
+            continue
+        if surface and surface != "all" and page["surface"] != surface.lower():
+            continue
+        if not include_archived and page["status"] == "archived":
+            continue
+        page["search_provider"] = "fts5"
+        page["search_score"] = hit.get("score")
+        out.append(page)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _fallback_ranked_pages(records: list[dict], *, query: str, surface: str, status: str, limit: int) -> list[dict]:
@@ -989,7 +1120,7 @@ def _fallback_ranked_pages(records: list[dict], *, query: str, surface: str, sta
             continue
         if surface and surface != "all" and page["surface"] != surface.lower():
             continue
-        score = _candidate_score(row, query, surface, status, include_document_content=True)
+        score = _score_normalized_page(page, query, surface, status, include_document_content=True)
         scored.append((score, -idx, page))
     scored.sort(key=lambda item: (item[0], item[1], item[2].get("updated_at", "")), reverse=True)
     return [page for _score, _idx, page in scored[:limit]]
@@ -1140,7 +1271,7 @@ def _source_fingerprint(page_id: str, records: list[dict]) -> str | None:
     if _is_wiki_record(row) and _record_to_page(row)["status"] != "archived":
         return semantic_snapshot(page_id, records=records)["revision_hash"]
     metadata = {key: value for key, value in row.items()
-                if key not in {"updatedAt", "createdAt", "useCount", "lastUsedAt", "lastQuery", "backlinks"}}
+                if key not in {"updatedAt", "createdAt", "useCount", "lastUsedAt", "lastQuery", "feedback", "backlinks"}}
     return hashlib.sha256(json.dumps(metadata, ensure_ascii=False, sort_keys=True,
                         separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
@@ -1282,7 +1413,7 @@ def apply_source_batch(batch: dict) -> dict:
     for row in batch["snapshots"]:
         _snapshot_page_revision(row)
     result = shared_memory.guarded_batch_upsert(upserts=batch["upserts"], expected=batch["expected_before"],
-                    fingerprint=_source_fingerprint, preserve_fields=("useCount", "lastUsedAt", "lastQuery"))
+                    fingerprint=_source_fingerprint, preserve_fields=("useCount", "lastUsedAt", "lastQuery", "feedback"))
     _CACHE.clear()
     return result
 
@@ -1846,8 +1977,35 @@ def _build_wiki_record(page: dict, *, existing: dict | None = None) -> dict:
     page_id = _clean(page.get("id") or _page_id(title, surface, kind), 80)
     links = _clean_links(page.get("links") or [], self_id=page_id)
 
+    raw_existing: dict[str, Any]
     if existing is None:
-        existing = get_page(page_id) or {}
+        raw_existing = _raw_wiki_record(page_id) or {}
+        existing = _record_to_page(raw_existing) if raw_existing else {}
+    elif isinstance(existing.get("raw"), dict):
+        raw_existing = existing["raw"]
+    else:
+        raw_existing = existing
+
+    # 사이드카(wiki_usage.sqlite) 델타가 존재하는 기존 페이지를 다시 저장할 때는
+    # hydrated useCount/feedback 를 events.jsonl 로 역류시키지 않고 raw 기준선을 유지해 이중 집계를 막는다.
+    has_sidecar = bool(page_id and raw_existing and wiki_usage_store.get_usage(page_id) is not None)
+    keep_raw_usage = bool(raw_existing) and (has_sidecar or isinstance(page.get("raw"), dict))
+    if keep_raw_usage:
+        persisted_use_count = _safe_count(raw_existing.get("useCount"))
+        persisted_last_used = _clean(raw_existing.get("lastUsedAt") or "", 80)
+        persisted_last_query = _clean(raw_existing.get("lastQuery") or "", 200)
+        persisted_feedback = deepcopy(raw_existing.get("feedback") or {})
+    else:
+        persisted_use_count = _safe_count(
+            page.get("useCount") if page.get("useCount") is not None else raw_existing.get("useCount")
+        )
+        persisted_last_used = _clean(page.get("lastUsedAt") or raw_existing.get("lastUsedAt") or "", 80)
+        persisted_last_query = _clean(page.get("lastQuery") or raw_existing.get("lastQuery") or "", 200)
+        persisted_feedback = (
+            deepcopy(page.get("feedback"))
+            if page.get("feedback") is not None
+            else deepcopy(raw_existing.get("feedback") or {})
+        )
     evidence_ids = page.get("evidence_ids") if "evidence_ids" in page else existing.get("evidence_ids")
     conflicting_evidence_ids = (
         page.get("conflicting_evidence_ids")
@@ -1913,12 +2071,10 @@ def _build_wiki_record(page: dict, *, existing: dict | None = None) -> dict:
         "createdAt": created_at,
         "updatedAt": updated_at,
         "kind": kind,
-        "useCount": _safe_count(
-            page.get("useCount") if page.get("useCount") is not None else existing.get("useCount")
-        ),
-        "lastUsedAt": _clean(page.get("lastUsedAt") or existing.get("lastUsedAt") or "", 80),
-        "lastQuery": _clean(page.get("lastQuery") or existing.get("lastQuery") or "", 200),
-        "feedback": page.get("feedback") if page.get("feedback") is not None else existing.get("feedback") or {},
+        "useCount": persisted_use_count,
+        "lastUsedAt": persisted_last_used,
+        "lastQuery": persisted_last_query,
+        "feedback": persisted_feedback,
         "source": {
             "surface": surface,
             "screen": surface,
@@ -2014,26 +2170,24 @@ def split_children_for_page(page: dict | None) -> list[dict]:
     return children
 
 
+def _page_exists(page_id: str) -> bool:
+    for row in _wiki_records():
+        if row.get("id") == page_id:
+            return True
+    return False
+
+
 def track_page_usage(page_id: str, query: str) -> None:
     """페이지가 LLM 컨텍스트로 제공될 때 호출한다. useCount 증가, lastUsedAt/lastQuery 갱신.
 
-    저장 계층 락 안에서 현재 값을 읽어 증분(shared_memory.patch_record) — 종전 get→upsert 는
-    동시 요청이 같은 useCount 를 읽어 증분 하나가 사라졌다. 다른 필드는 손대지 않는다."""
+    경량 SQLite WAL 사이드카(`wiki_usage.sqlite`)에 원자적으로 기록해 매 질의마다 수십 MB
+    `events.jsonl` 전체를 재작성하거나 `_debounced_rebuild()`를 유발하지 않는다."""
     page_id = _clean(page_id, 80)
-    if not page_id:
+    if not page_id or not _page_exists(page_id):
         return
     query_text = _clean(query, 200)
-
-    def _bump(record: dict) -> dict:
-        record["useCount"] = _safe_count(record.get("useCount")) + 1
-        record["lastUsedAt"] = _now()
-        record["lastQuery"] = query_text
-        return record
-
-    if shared_memory.patch_record(page_id, _bump) is None:
-        return
-    _CACHE.clear()
-    _debounced_rebuild()
+    wiki_usage_store.increment_usage(page_id, query_text, _now())
+    _clear_usage_derived_cache()
 
 
 def _store_page_feedback(page_id: str, rating: str) -> None:
@@ -2041,19 +2195,10 @@ def _store_page_feedback(page_id: str, rating: str) -> None:
     if rating not in ("helpful", "not_helpful", "neutral"):
         return
     page_id = _clean(page_id, 80)
-    if not page_id:
+    if not page_id or not _page_exists(page_id):
         return
-
-    def _bump(record: dict) -> dict:
-        feedback = dict(record.get("feedback") or {})
-        feedback[rating] = _safe_count(feedback.get(rating)) + 1
-        record["feedback"] = feedback
-        return record
-
-    if shared_memory.patch_record(page_id, _bump) is None:
-        return
-    _CACHE.clear()
-    _debounced_rebuild()
+    wiki_usage_store.increment_feedback(page_id, rating)
+    _clear_usage_derived_cache()
 
 
 def _last_used_or_created(page: dict) -> str:
@@ -2079,6 +2224,7 @@ def delete_page(page_id: str) -> bool:
     if not page_id:
         return False
     deleted = shared_memory.delete_record(page_id)
+    wiki_usage_store.delete_usage(page_id)
     _CACHE.clear()
     if deleted:
         _debounced_rebuild()
@@ -2523,7 +2669,7 @@ def _merge_pages(
         return None
     applied = shared_memory.guarded_batch_upsert(
         upserts=plan["upserts"], expected=plan["expected"], fingerprint=_source_fingerprint,
-        preserve_fields=("useCount", "lastUsedAt", "lastQuery"),
+        preserve_fields=("useCount", "lastUsedAt", "lastQuery", "feedback"),
     )
     _CACHE.clear()
     if applied.get("status") != "applied":
