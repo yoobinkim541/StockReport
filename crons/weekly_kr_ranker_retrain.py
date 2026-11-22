@@ -36,9 +36,12 @@ def main() -> int:
         from ml.data_pipeline import build_ml_dataset, KR_BENCHMARK
         from ml.ranker import (
             adopt_if_better,
+            champion_status,
             evaluate_ranker_backend,
+            format_adopt_line,
             format_backend_evaluation,
             format_validation_lines,
+            save_gate_diagnostics,
             train_ranker,
         )
         from ml.kr_ranker import KR_MODE, KR_MODEL_CACHE
@@ -48,7 +51,10 @@ def main() -> int:
             logger.warning("KR 데이터셋 비어있음 — 재학습 생략")
             return 0
         result = train_ranker(ds, n_folds=4)
-        adopted, champ_ic = adopt_if_better(result, KR_MODEL_CACHE)
+        before_champ = champion_status(KR_MODEL_CACHE)
+        adopted, _champ_ic = adopt_if_better(result, KR_MODEL_CACHE)
+        after_champ = champion_status(KR_MODEL_CACHE) if adopted else before_champ
+        save_gate_diagnostics(result, KR_MODEL_CACHE, adopted=adopted, champ_status=after_champ)
         mean_ic = result.meta["validation_metrics"].get("mean_ic")
         xgb_line = ""
         xgb_enabled = os.getenv(
@@ -59,8 +65,7 @@ def main() -> int:
             xgb_eval = evaluate_ranker_backend(ds, backend="xgboost", use_ranker=False, n_folds=3)
             xgb_line = format_backend_evaluation(xgb_eval, champion_wf_ic=mean_ic)
 
-        champion_text = f"{champ_ic:+.3f}" if champ_ic is not None else "n/a"
-        adopt_str = ("채택 ✅" if adopted else f"보류 ⏸️ (챔피언 IC {champion_text} 유지)")
+        adopt_str = format_adopt_line(adopted, after_champ)
         msg = "\n".join(x for x in [
             "🇰🇷 KR 랭커 주간 재학습 (Purged WF · vs KOSPI · 챔피언/챌린저)",
             "━━━━━━━━━━━━━━",

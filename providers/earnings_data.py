@@ -231,6 +231,8 @@ def quarterly_fundamentals(ticker: str, *, force: bool = False, _t=None) -> dict
     US=yfinance quarterly_income_stmt(최근 ~5분기)·income_stmt(연간 ~4년). KR 도
     yfinance 가 주는 만큼(있으면) — ETF·매크로는 손익계산서가 없어 빈 rows(graceful).
     """
+    if _known_etf(ticker):
+        return {"ticker": ticker, "quarterly": [], "annual": []}
     key = f"fund_{ticker}"
     if not force:
         c = _cache_get(key)
@@ -288,6 +290,8 @@ def consensus(ticker: str, *, _t=None) -> dict:
                              "eps_rev_down_30d", "revision_momentum", "target_mean", "target_upside_pct",
                              "target_high", "target_low", "target_median",
                              "rec_strong_buy", "rec_buy", "rec_hold", "rec_sell", "rec_strong_sell")}
+    if _known_etf(ticker):
+        return out
     if is_kr(ticker) and _t is None:
         # yfinance 의 KR 목표가·추정치는 실제와 어긋나 신뢰불가 → Naver(국내 증권사
         # 컨센서스)로 대체. 리비전·분포 등 미제공 필드는 None 유지(소비자 graceful).

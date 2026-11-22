@@ -687,6 +687,93 @@ def load_ranker(path: Path = MODEL_CACHE) -> Optional[RankerResult]:
     return safe_unpickle(path)
 
 
+def champion_status(path: Path = MODEL_CACHE) -> dict:
+    """캐시된 챔피언 모델의 실제 게이트 통과·활성 여부를 검사한다.
+
+    게이트를 통과하지 못하거나 노화(>90일)된 구 .pkl 은 추론 시 비활성(shadow-only)이므로,
+    보고서에서 활성 챔피언이 유지되는 것처럼 오해하지 않도록 active 여부를 명확히 구분한다.
+    """
+    champ = load_ranker(path)
+    if champ is None:
+        return {
+            "exists": path.exists(),
+            "active": False,
+            "oos_ic": None,
+            "train_end_date": None,
+            "gate_reasons": ["missing_or_unreadable"] if path.exists() else ["no_champion"],
+        }
+    gate = ranker_gate(champ)
+    ic = getattr(champ, "oos_ic", None)
+    return {
+        "exists": True,
+        "active": bool(gate["passed"]),
+        "oos_ic": float(ic) if _finite(ic) else None,
+        "train_end_date": getattr(champ, "train_end_date", None),
+        "gate_reasons": list(gate["reasons"]),
+    }
+
+
+def format_adopt_line(adopted: bool, champ_status: dict, *, emoji: str = "✅") -> str:
+    """주간 재학습 보고서의 채택/보류 1줄 요약 — 비활성 구 챔피언과 활성 챔피언을 구분 표기."""
+    if adopted:
+        return f"채택 {emoji}"
+    if champ_status.get("active"):
+        ic = champ_status.get("oos_ic")
+        ic_str = f"{ic:+.3f}" if _finite(ic) else "n/a"
+        return f"보류 shadow (챔피언 IC {ic_str} 유지)"
+    if champ_status.get("exists"):
+        ic = champ_status.get("oos_ic")
+        ic_str = f", 구 캐시 IC {ic:+.3f}" if _finite(ic) else ""
+        return f"보류 shadow (활성 챔피언 없음 · 기존 캐시 gate 미통과/노화{ic_str} — 추론 비활성)"
+    return "보류 shadow (활성 챔피언 없음 — 추론 비활성)"
+
+
+def save_gate_diagnostics(
+    result: RankerResult,
+    path: Path = MODEL_CACHE,
+    *,
+    adopted: bool,
+    champ_status: dict | None = None,
+) -> Path:
+    """매주 게이트 평가 증거를 `<model_stem>_gate_last.json` 으로 원자적 저장해 관측성 유지."""
+    gate = ranker_gate(result)
+    meta = getattr(result, "meta", {}) or {}
+    metrics = meta.get("validation_metrics") or {}
+    base = meta.get("validation_baseline") or {}
+    st = champ_status if champ_status is not None else champion_status(path)
+
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model_path": str(path),
+        "adopted": bool(adopted),
+        "champion_active": bool(st.get("active")),
+        "champion_oos_ic": st.get("oos_ic"),
+        "champion_train_end": st.get("train_end_date"),
+        "train_end_date": getattr(result, "train_end_date", None),
+        "gate_passed": bool(gate["passed"]),
+        "gate_reasons": list(gate["reasons"]),
+        "wf_mean_ic": metrics.get("mean_ic"),
+        "baseline_feature": base.get("feature"),
+        "baseline_ic": base.get("mean_ic"),
+        "top_decile_excess": metrics.get("top_decile_excess"),
+        "transaction_cost": metrics.get("transaction_cost"),
+        "mdd": metrics.get("mdd"),
+        "baseline_mdd": base.get("mdd"),
+        "brier": metrics.get("brier"),
+        "baseline_brier": base.get("brier"),
+        "ece": metrics.get("ece"),
+        "baseline_ece": base.get("ece"),
+        "clean_mean_ic": metrics.get("clean_mean_ic"),
+        "clean_top_decile_excess": metrics.get("clean_top_decile_excess"),
+    }
+    diag_path = path.with_name(f"{path.stem}_gate_last.json")
+    diag_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = diag_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(diag_path)
+    return diag_path
+
+
 def adopt_if_better(result: RankerResult, path: Path = MODEL_CACHE, *,
                     tol: float = 0.01) -> tuple[bool, float | None]:
     """챔피언/챌린저 채택 게이트 — 게이트 통과 + 통과 챔피언보다 WF IC 가 tol 이상 나쁘지 않을 때 저장.

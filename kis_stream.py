@@ -53,6 +53,7 @@ TR_US_TRADE = "HDFSCNT0"   # 美 실시간지연체결가 (★미국=0분지연=
 TR_US_ASK = "HDFSASP0"     # 美 실시간호가 (★미국=무료 실시간 1호가; HDFSASP1 은 아시아 지연이라 미사용)
 
 FLUSH_SECS = float(os.getenv("REALTIME_FLUSH_SECS", "1.0"))
+IDLE_FLUSH_SECS = max(FLUSH_SECS, min(float(os.getenv("REALTIME_IDLE_FLUSH_SECS", "15.0")), 45.0))
 KR_MAX = int(os.getenv("REALTIME_KR_MAX", "10"))
 US_MAX = int(os.getenv("REALTIME_US_MAX", "10"))
 BARS_ENABLED = os.getenv("INTRADAY_BARS_ENABLED", "false").lower() == "true"
@@ -607,6 +608,20 @@ def _apply(latest: dict, rec: dict, *, delayed: bool) -> None:
             e["price"] = rec["best_ask"]
 
 
+def should_flush_quotes(
+    now: float,
+    last_flush: float,
+    dirty: bool,
+    *,
+    flush_secs: float = FLUSH_SECS,
+    idle_flush_secs: float = IDLE_FLUSH_SECS,
+) -> bool:
+    """실시간 틱이 들어왔을 때는 flush_secs(1s), 유휴·휴장 시에는 idle_flush_secs(15s) 하트비트 주기로 flush."""
+    elapsed = now - last_flush
+    interval = flush_secs if dirty else max(flush_secs, idle_flush_secs)
+    return elapsed >= interval
+
+
 # ── 비동기 루프 (라이브·MH 검증) ─────────────────────────────────────────────
 
 async def _session(approval_key: str) -> None:
@@ -636,9 +651,11 @@ async def _session(approval_key: str) -> None:
 
         aes_keys: dict = {}     # 체결통보 복호화 키 (구독 ACK 에서 수집)
         last_flush = last_refresh = time.time()
+        dirty = True            # 접속 직후 초기 하트비트 flush 보장
         while True:
+            wait_secs = FLUSH_SECS if dirty else IDLE_FLUSH_SECS
             try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=FLUSH_SECS)
+                raw = await asyncio.wait_for(ws.recv(), timeout=wait_secs)
             except asyncio.TimeoutError:
                 raw = None
             if raw:                                          # 빈 프레임 → raw[0] IndexError 로 세션이 끊기던 것 방지
@@ -655,16 +672,19 @@ async def _session(approval_key: str) -> None:
                     else:                                        # 평문 = 시세(체결/호가)
                         for rec in parse_realtime_frame(raw):
                             _apply(latest, rec, delayed=False)   # KR·美 모두 무료 실시간(美 0분지연)
+                            dirty = True
                 except (ValueError, KeyError, IndexError, TypeError) as e:
                     # 프레임 1건 파싱 실패는 그 프레임만 버린다 — 세션 예외로 번지면 재접속·백오프
                     logger.warning("프레임 파싱 실패(무시): %s — %.80r", e, raw)
             now = time.time()
-            if now - last_flush >= FLUSH_SECS:
+            if should_flush_quotes(now, last_flush, dirty):
                 _flush(latest, market="KR/US" if us_enabled() else "KR", connected=True)
                 _flush_bars(now)
                 _maintain_orderflow(time.strftime("%Y-%m-%d", time.gmtime(now)))
-                _flush_orderflow()
+                if _ORDERFLOW_PENDING:
+                    _flush_orderflow()
                 last_flush = now
+                dirty = False
             if now - last_refresh >= WATCHLIST_REFRESH_SECS:
                 new_sel, _ = compute_watchlist()
                 if new_sel != sel:    # diff 등록/해제 (재구독으로 단순화 — 캡 내라 안전)

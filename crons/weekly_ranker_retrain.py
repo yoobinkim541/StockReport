@@ -33,16 +33,23 @@ def main() -> int:
     try:
         from ml.data_pipeline import build_ml_dataset
         from ml.ranker import (
+            MODEL_CACHE,
             adopt_if_better,
+            champion_status,
             evaluate_ranker_backend,
+            format_adopt_line,
             format_backend_evaluation,
             format_validation_lines,
+            save_gate_diagnostics,
             train_ranker,
         )
 
         ds = build_ml_dataset(mode="nasdaq100", days=756, forward_days=20)
         result = train_ranker(ds, n_folds=4)
-        adopted, champ_ic = adopt_if_better(result)
+        before_champ = champion_status(MODEL_CACHE)
+        adopted, _champ_ic = adopt_if_better(result)
+        after_champ = champion_status(MODEL_CACHE) if adopted else before_champ
+        save_gate_diagnostics(result, MODEL_CACHE, adopted=adopted, champ_status=after_champ)
         mean_ic = result.meta["validation_metrics"].get("mean_ic")
         xgb_line = ""
         if os.getenv("RANKER_XGB_CHALLENGER_ENABLED", "1").lower() not in {"0", "false", "no", "off"}:
@@ -56,8 +63,7 @@ def main() -> int:
         except Exception as exc:
             recommendation_health = f"Recommendation health: unavailable ({type(exc).__name__})"
 
-        champion_text = f"{champ_ic:+.3f}" if champ_ic is not None else "n/a"
-        adopt_str = ("채택 ✅" if adopted else f"보류 shadow (챔피언 IC {champion_text} 유지)")
+        adopt_str = format_adopt_line(adopted, after_champ)
         msg = "\n".join(x for x in [
             "🔄 랭커 주간 재학습 (Purged WF · 챔피언/챌린저)",
             "━━━━━━━━━━━━━━",
@@ -67,6 +73,7 @@ def main() -> int:
             recommendation_health,
             "⚠️ WF IC < 0.02 지속 시 DCA 틸트 비중 축소 검토",
         ] if x)
+        logger.info(msg)
         send_cron_telegram(msg)
         logger.info("재학습·보고 완료 (WF mean IC=%s)", mean_ic)
         return 0

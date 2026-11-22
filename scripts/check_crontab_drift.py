@@ -20,6 +20,7 @@ RELEVANT_MARKERS = (
     "reports.wiki_backfill",
     "reports.institution_watch",
     "reports.wiki_ontology_insights",
+    "wiki_insight_eval.py",
     "news_llm_snapshot.py",
 )
 

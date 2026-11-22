@@ -118,6 +118,8 @@ def _run_debounced_rebuild() -> None:
         _REBUILD_RUNNING = True
     try:
         rebuild_artifacts()
+    except safe_io.LockTimeout:
+        logger.info("위키 아티팩트 백그라운드 재빌드 건너뜀(다른 프로세스가 publication.lock 보유 중)")
     finally:
         with _REBUILD_LOCK:
             _REBUILD_RUNNING = False

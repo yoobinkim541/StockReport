@@ -74,8 +74,6 @@ PATH=/home/ubuntu/.hermes/node/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/b
 30 0 * * 1-5 cd /home/ubuntu/projects/stock-report && flock -n /tmp/kiwoom_mock_track.lock uv run python crons/kiwoom_mock_track.py >> /tmp/kiwoom_mock_track.log 2>&1   # 00:30 UTC = 09:30 KST
 # 국내 모의 일일 현황 보고 (장 마감 직후 — NAV·손익·편입/퇴출 사유·vs KOSPI·MDD)
 40 6 * * 1-5 cd /home/ubuntu/projects/stock-report && flock -n /tmp/kiwoom_mock_report.lock uv run python crons/kiwoom_mock_report.py >> /tmp/kiwoom_mock_report.log 2>&1   # 06:40 UTC = 15:40 KST
-# 키움 국내 모의투자 3개월 만기 갱신 리마인더 (스크립트가 2026-10-28에만 발송·중복 방지)
-0 0 28 10 * cd /home/ubuntu/projects/stock-report && uv run python crons/kiwoom_mock_renewal_reminder.py >> /tmp/kiwoom_mock_renewal_reminder.log 2>&1   # 2026-10-28 00:00 UTC = 09:00 KST
 # KR 투자자 수급 + KOSPI200 멤버십 forward 스냅샷 (Naver — pykrx 공백 복구, 시점별 이력 축적)
 30 7 * * 1-5 cd /home/ubuntu/projects/stock-report && uv run python crons/naver_flow_snapshot.py >> /tmp/naver_flow_snapshot.log 2>&1   # 07:30 UTC = 16:30 KST
 
@@ -95,8 +93,8 @@ PATH=/home/ubuntu/.hermes/node/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/b
 * * * * * cd /home/ubuntu/projects/stock-report && bash scripts/kis_stream_watchdog.sh >> /tmp/kis_stream_watchdog.log 2>&1   # 매 1분 (꺼져있으면 no-op)
 # 퀀트 터미널 streamlit 대시보드 워치독 (DASHBOARD_ENABLED=true 일 때만 기동·opt-in)
 * * * * * cd /home/ubuntu/projects/stock-report && bash scripts/dashboard_watchdog.sh >> /tmp/dashboard_watchdog.log 2>&1   # 매 1분 (꺼져있으면 no-op)
-# 퀀트 터미널 Cloudflare 터널 워치독 (DASHBOARD_ENABLED=true 시·터널 죽으면 재시작+Vercel 현관 URL 자동갱신)
-* * * * * cd /home/ubuntu/projects/stock-report && bash scripts/cloudflared_watchdog.sh >> /tmp/cloudflared_watchdog.log 2>&1   # 매 1분 (꺼져있으면 no-op)
+# 퀀트 터미널 Cloudflare 터널 워치독 ([2026-11-14 폐기: 고정 터널 ybkim-personal 로 대체])
+# * * * * * cd /home/ubuntu/projects/stock-report && bash scripts/cloudflared_watchdog.sh >> /tmp/cloudflared_watchdog.log 2>&1   # 매 1분 (꺼져있으면 no-op)
 # S&P500 시장 맵 스냅샷 (대시보드 홈 트리맵 콜드로드 ~60초 → 즉시 로드용·표시데이터)
 */20 * * * * cd /home/ubuntu/projects/stock-report && flock -n /tmp/sp500_heatmap_snapshot.lock uv run python crons/sp500_heatmap_snapshot.py >> /tmp/sp500_heatmap_snapshot.log 2>&1   # 매 20분
 # 소스 그룹별 독립 수집 → 한 출처 지연/실패가 다른 그룹을 막지 않음
@@ -112,6 +110,7 @@ PATH=/home/ubuntu/.hermes/node/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/b
 25 4 * * * cd /home/ubuntu/projects/stock-report && flock -n /tmp/wiki_autonomous_curator.lock env WIKI_AUTONOMOUS_MAX_OPERATIONS=6 uv run python -m reports.wiki_autonomous_curator >> /tmp/wiki_autonomous_curator.log 2>&1   # 매일 — 대주제 병합·의미 단위 분할
 45 4 * * * cd /home/ubuntu/projects/stock-report && flock -n /tmp/wiki_backfill.lock env WIKI_BACKFILL_BATCH_SIZE=5 uv run python -m reports.wiki_backfill >> /tmp/wiki_backfill.log 2>&1   # 매일 — 기존 판단 문서 5건씩 새 문체 백필
 40 1,7,13,19 * * * cd /home/ubuntu/projects/stock-report && flock -n /tmp/wiki_ontology.lock uv run python -m reports.wiki_ontology_insights --apply >> /tmp/wiki_ontology.log 2>&1   # 6시간마다 — claim 에서 개체·관계 추출(6회 상한) → 온톨로지 컴파일 → 교차 출처 인사이트(3건 상한)
+10 5 * * * cd /home/ubuntu/projects/stock-report && flock -n /tmp/wiki_insight_eval.lock uv run python crons/wiki_insight_eval.py >> /tmp/wiki_insight_eval.log 2>&1   # 매일 05:10 UTC = 14:10 KST — 성숙 위키 인사이트 사후 성과 검증(wiki_insight_outcomes.jsonl)
 30 2 * * 1 cd /home/ubuntu/projects/stock-report && uv run python -m reports.institution_watch >> /tmp/institution_watch.log 2>&1   # 월요일 02:30 UTC — 다기관 위키 갱신 + 공통 패턴 digest 축적
 
 # ── 주간 스냅샷 (토요일) ─────────────────────────────────────────────────────

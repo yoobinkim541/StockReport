@@ -32,10 +32,13 @@ SNAP_PATH = Path.home() / "reports" / "ml-cache" / "earnings_snapshots.jsonl"
 
 
 def _universe() -> list[str]:
-    """포트폴리오 + 美 주요기업 + 韓 대형주(열화모드). 중복 제거."""
+    """포트폴리오 + 美 주요기업 + 韓 대형주(열화모드). 중복 제거 · 알려진 ETF 제외(404 방지)."""
     from ml.data_pipeline import US_TOP50, KR_TOP10_META
     from ml.entry_analyzer import portfolio_stocks
-    return list(dict.fromkeys(portfolio_stocks() + list(US_TOP50) + list(KR_TOP10_META.keys())))
+    from providers.etf_data import is_etf
+
+    raw = list(dict.fromkeys(portfolio_stocks() + list(US_TOP50) + list(KR_TOP10_META.keys())))
+    return [t for t in raw if not is_etf(t)]
 
 
 def _row(ticker: str, today: str) -> dict:
