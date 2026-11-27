@@ -2,7 +2,7 @@
 # dashboard_watchdog.sh — 퀀트 터미널 streamlit 자동 재시작(2중 감시).
 # DASHBOARD_ENABLED=true 일 때만 기동(opt-in·기본 no-op).
 #   ① liveness  : _stcore/health 로 프로세스 생존 확인 (죽었으면 재시작)
-#   ② freshness : 대시보드가 import 하는 소스 .py 의 mtime > 프로세스 기동시각 이면
+#   ② freshness : 대시보드 소스(.py·reconnect.js)가 프로세스 기동보다 최신이면
 #                 'stale' 로 보고 재시작. 장수 프로세스 + 디스크 코드 변경 시 Streamlit
 #                 부분 핫리로드가 옛 서브모듈을 메모리에 붙들어
 #                 'AttributeError: module has no attribute ...' 렌더 크래시가 나던 문제 방지.
@@ -32,8 +32,14 @@ if [ "${DASHBOARD_ENABLED,,}" != "true" ]; then
 fi
 
 PORT="${DASHBOARD_PORT:-8501}"
-# streamlit 프로세스 식별 패턴 — .venv 경로까지 포함해 무관 프로세스 오매칭 방지
-STREAMLIT_PAT='[.]venv/bin/streamlit run dashboard/app.py'
+# 배포 시 기존 app.py 프로세스도 식별해 새 server.py 진입점으로 교체한다.
+dashboard_pid() {
+    ps -eo pid=,args= | awk '
+        /^ *[0-9]+ +([^ ]*\/)?python[0-9.]* +([^ ]*\/)?[.]venv\/bin\/streamlit run dashboard\/(app|server)[.]py( |$)/ {
+            print $1
+            exit
+        }'
+}
 
 # 재시작 — 대상 프로세스 종료(포트 확보) 후 run_dashboard.sh 를 detach 기동
 restart_dashboard() {
@@ -55,12 +61,12 @@ restart_dashboard() {
 
 # ① liveness — 죽었으면 재시작
 if ! curl -fsS -m 3 "http://127.0.0.1:${PORT}/_stcore/health" 2>/dev/null | grep -q "ok"; then
-    restart_dashboard "미실행/헬스실패" "$(pgrep -f "$STREAMLIT_PAT" | head -1)"
+    restart_dashboard "미실행/헬스실패" "$(dashboard_pid)"
     exit 0
 fi
 
 # ② freshness — 살아있어도 코드가 프로세스보다 최신이면 stale 로 재시작
-PID="$(pgrep -f "$STREAMLIT_PAT" | head -1)"
+PID="$(dashboard_pid)"
 if [ -n "$PID" ]; then
     START_EPOCH="$(date -d "$(ps -o lstart= -p "$PID" 2>/dev/null)" +%s 2>/dev/null)"
     if [ -n "$START_EPOCH" ]; then
@@ -69,12 +75,13 @@ if [ -n "$PID" ]; then
         # streamlit 이 fork 후 실제 모듈 import 까지 수 초 걸리는 창도 함께 흡수(+5s).
         # 배포는 항상 직전 재시작보다 수 초+ 뒤에 안착하므로 stale 탐지엔 영향 없음.
         THRESH=$((START_EPOCH + 5))
-        # 대시보드 import 트리(+루트 공용 모듈)에서 기동 이후 변경된 첫 .py 를 탐색
+        # 대시보드 import 트리와 브라우저 재접속 가드를 감시한다.
         NEWER="$(find "$PROJECT_DIR"/dashboard "$PROJECT_DIR"/ml "$PROJECT_DIR"/providers \
                       "$PROJECT_DIR"/agent_console "$PROJECT_DIR"/reports \
                       "$PROJECT_DIR"/bot "$PROJECT_DIR"/lib "$PROJECT_DIR"/config \
                       "$PROJECT_DIR"/*.py \
-                      -name '*.py' -not -path '*/__pycache__/*' \
+                      \( -name '*.py' -o -path "$PROJECT_DIR/dashboard/reconnect.js" \) \
+                      -not -path '*/__pycache__/*' \
                       -newermt "@${THRESH}" -print -quit 2>/dev/null)"
         if [ -n "$NEWER" ]; then
             restart_dashboard "코드 변경 감지(stale): ${NEWER#"$PROJECT_DIR"/}" "$PID"

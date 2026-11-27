@@ -31,12 +31,11 @@ if "tn_light" not in st.session_state:
         st.session_state["tn_light"] = False
 theme.inject_global_css()   # 세션 tn_light 를 읽어 라이트/다크 표면 CSS 주입
 
-# 테마 쿠키 + 재기동 워치독은 iframe 하나 — 매 rerun 마운트를 줄인다.
+# 테마 쿠키는 브라우저 선택을 다음 Streamlit 세션으로 가져간다.
 st.iframe(
     "<script>parent.document.cookie='tn_theme="
     + ("light" if st.session_state["tn_light"] else "dark")
-    + "; path=/; max-age=31536000; SameSite=Lax'</script>"
-    + auth.reconnect_watchdog_html(),
+    + "; path=/; max-age=31536000; SameSite=Lax'</script>",
     height=1)
 
 from dashboard.pages import ai_console, ai_wiki, chart_full, home, kr_etf, market, paper, portfolio, research, watchlist

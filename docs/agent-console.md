@@ -35,6 +35,8 @@ bash scripts/run_dashboard.sh
 
 대시보드 사이드바에서 `AI 콘솔`만 연다. 위키는 콘솔 안의 `기억·위키` 드로어에서 쓴다.
 
+Cloudflare Access 인증이 만료되거나 거부되면 열린 대시보드 탭의 자동 재접속을 중단한다. `다시 로그인`을 누르면 현재 주소를 다시 열어 Access 인증을 진행한다. 일반 네트워크 오류와 서버 재기동은 자동 복구 대상이다. 이 동작은 `scripts/run_dashboard.sh`가 사용하는 `dashboard/server.py` 진입점에서 적용된다.
+
 ### 별도 Flask 콘솔로 사용
 
 ```bash

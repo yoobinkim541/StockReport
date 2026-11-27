@@ -274,34 +274,3 @@ def password_gate() -> bool:
                 return False
         st.error("비밀번호가 틀렸습니다.")
     return False
-
-
-def reconnect_watchdog_html(interval_ms: int = 3000) -> str:
-    """서버 재기동 감지 → 자동 새로고침 스크립트 (순수 HTML — st.iframe 으로 주입).
-
-    health 폴링이 '실패 → 회복' 전이를 보면 부모 창을 리로드한다. 쿠키 세션 도입으로
-    리로드 후에도 서명 토큰이 유효하면 무입력 재인증(비번 화면으로 안 튕김).
-    hair-trigger 방어: fetch 에 2.5s 타임아웃 + **연속 3회 실패**부터 down 판정
-    (일시적 커넥션 리셋 1회로 리로드되던 문제 — 조사 확정).
-    Streamlit srcdoc 컴포넌트는 same-origin — 상대경로 fetch·parent reload 동작.
-    """
-    return f"""<script>
-(function() {{
-  let down = false, fails = 0;
-  setInterval(async () => {{
-    const ctl = new AbortController();
-    const tm = setTimeout(() => ctl.abort(), 2500);
-    try {{
-      const r = await fetch("/_stcore/health", {{cache: "no-store", signal: ctl.signal}});
-      clearTimeout(tm);
-      if (r.ok) {{
-        if (down) window.parent.location.reload();   // 서버 복귀 → 쿠키로 자동 재인증
-        fails = 0;
-      }} else if (++fails >= 3) {{ down = true; }}
-    }} catch (e) {{
-      clearTimeout(tm);
-      if (++fails >= 3) down = true;                 // 단발 리셋/타임아웃은 무시
-    }}
-  }}, {int(interval_ms)});
-}})();
-</script>"""

@@ -1,13 +1,16 @@
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import time
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _sandbox(tmp_path, worker):
+def _sandbox(tmp_path, worker, dependency_path, entrypoint):
     project = tmp_path / "project"
     scripts = project / "scripts"
     scripts.mkdir(parents=True)
@@ -27,22 +30,34 @@ def _sandbox(tmp_path, worker):
     bins.mkdir()
     for name, content in {
         "curl": '#!/usr/bin/env bash\nprintf "ok\\n"\n',
-        "pgrep": f'#!/usr/bin/env bash\nprintf "{worker.pid}\\n"\n',
+        "ps": (
+            '#!/usr/bin/env bash\n'
+            'if [[ "$1" == "-eo" ]]; then\n'
+            '  printf "  2147483647 bash -c .venv/bin/streamlit run dashboard/server.py\\n"\n'
+            f'  printf "  {worker.pid} /project/.venv/bin/python3 .venv/bin/streamlit run dashboard/{entrypoint}\\n"\n'
+            'else\n'
+            f'  exec "{shutil.which("ps")}" "$@"\n'
+            'fi\n'
+        ),
     }.items():
         path = bins / name
         path.write_text(content)
         path.chmod(0o755)
-    dependency = project / "reports/wiki_distillation.py"
+    dependency = project / dependency_path
     dependency.write_text("# test source\n")
     env = {**os.environ, "PATH": str(bins) + os.pathsep + os.environ["PATH"],
            "DASHBOARD_TEST_LAUNCH_LOG": str(launch_log)}
     return script, dependency, launch_log, env
 
 
-def test_reports_update_restarts_the_exact_healthy_dashboard_worker(tmp_path):
+@pytest.mark.parametrize(("dependency_path", "entrypoint"), [
+    ("reports/wiki_distillation.py", "app.py"),
+    ("dashboard/reconnect.js", "server.py"),
+])
+def test_newer_dependency_restarts_the_exact_worker(tmp_path, dependency_path, entrypoint):
     worker = subprocess.Popen(["sleep", "300"])
     try:
-        script, dependency, launch_log, env = _sandbox(tmp_path, worker)
+        script, dependency, launch_log, env = _sandbox(tmp_path, worker, dependency_path, entrypoint)
         future = time.time() + 60
         os.utime(dependency, (future, future))
         result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=15)
@@ -61,7 +76,7 @@ def test_reports_update_restarts_the_exact_healthy_dashboard_worker(tmp_path):
 def test_older_reports_do_not_restart_a_healthy_dashboard_worker(tmp_path):
     worker = subprocess.Popen(["sleep", "300"])
     try:
-        script, dependency, launch_log, env = _sandbox(tmp_path, worker)
+        script, dependency, launch_log, env = _sandbox(tmp_path, worker, "dashboard/reconnect.js", "server.py")
         old = time.time() - 300
         os.utime(dependency, (old, old))
         result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=15)
